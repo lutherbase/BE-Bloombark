@@ -1,0 +1,25 @@
+{
+  "name": "bloomberg-terminal-backend",
+  "version": "1.0.0",
+  "description": "Bloomberg Terminal Apps Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.112.2",
+    "axios": "^1.6.0",
+    "better-sqlite3": "^12.11.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "ethers": "^6.17.0",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.3",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
