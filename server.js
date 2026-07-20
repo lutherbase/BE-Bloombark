@@ -10,7 +10,7 @@ const axios        = require('axios');
 const jwt          = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const crypto       = require('crypto');
-const Database     = require('better-sqlite3');
+const mysql        = require('mysql2/promise');
 const path         = require('path');
 const { ethers }   = require('ethers');
 
@@ -33,59 +33,105 @@ try { fs.writeFileSync(SECRETS_FILE, JSON.stringify(_secrets)); } catch (_) {}
 const JWT_SECRET = process.env.JWT_SECRET || _secrets.JWT_SECRET;
 const ENC_KEY    = process.env.ENC_KEY    || _secrets.ENC_KEY;
 
-// ─── SQLite DB ─────────────────────────────────────────────────────────────────
-const db = new Database(process.env.DB_FILE_PATH || path.join(__dirname, 'bloombark.db'));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    wallet            TEXT UNIQUE NOT NULL,
-    wallet_enc        TEXT,
-    generated_address TEXT,
-    generated_key_enc TEXT,
-    meta              TEXT,
-    created_at        INTEGER DEFAULT (strftime('%s','now')),
-    last_login        INTEGER
-  );
+// ─── MySQL DB (Aiven-compatible: SSL on by default) ─────────────────────────────
+// DB_SSL defaults to true — Aiven requires TLS. Set DB_SSL=false only for a
+// plain local MySQL with no TLS listener. DB_SSL_CA points at a downloaded CA
+// bundle (e.g. Aiven's ca.pem) when the server cert isn't in the system trust
+// store; otherwise we just validate against the system CAs.
+const DB_SSL = (process.env.DB_SSL || 'true').toLowerCase() !== 'false';
+const pool = mysql.createPool({
+  host:     process.env.DB_HOST || '127.0.0.1',
+  port:     parseInt(process.env.DB_PORT) || 3306,
+  user:     process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'bloombark',
+  waitForConnections: true,
+  connectionLimit: parseInt(process.env.DB_POOL_SIZE) || 10,
+  queueLimit: 0,
+  ssl: !DB_SSL ? undefined : {
+    ...(process.env.DB_SSL_CA ? { ca: fs.readFileSync(process.env.DB_SSL_CA, 'utf8') } : {}),
+    rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false',
+  },
+});
 
-  CREATE TABLE IF NOT EXISTS sessions (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    wallet     TEXT NOT NULL,
-    jwt_hash   TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    created_at INTEGER DEFAULT (strftime('%s','now'))
-  );
+// Thin helpers mirroring better-sqlite3's .get()/.all()/.run() so the rest of
+// this file reads the same as before, just with `await` in front of each call.
+async function dbGet(sql, params = []) { const [rows] = await pool.query(sql, params); return rows[0] || null; }
+async function dbAll(sql, params = []) { const [rows] = await pool.query(sql, params); return rows; }
+async function dbRun(sql, params = []) { const [result] = await pool.query(sql, params); return result; }
 
-  CREATE TABLE IF NOT EXISTS app_config (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at INTEGER DEFAULT (strftime('%s','now'))
-  );
-`);
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id                INT PRIMARY KEY AUTO_INCREMENT,
+      wallet            VARCHAR(255) UNIQUE NOT NULL,
+      wallet_enc        TEXT,
+      generated_address VARCHAR(255),
+      generated_key_enc TEXT,
+      meta              TEXT,
+      created_at        INT DEFAULT (UNIX_TIMESTAMP()),
+      last_login        INT
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id         INT PRIMARY KEY AUTO_INCREMENT,
+      wallet     VARCHAR(255) NOT NULL,
+      jwt_hash   VARCHAR(255) NOT NULL,
+      expires_at INT NOT NULL,
+      created_at INT DEFAULT (UNIX_TIMESTAMP())
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_config (
+      \`key\`     VARCHAR(255) PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at INT DEFAULT (UNIX_TIMESTAMP())
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      wallet       VARCHAR(255) PRIMARY KEY,
+      display_name VARCHAR(255),
+      avatar       MEDIUMTEXT,
+      updated_at   INT DEFAULT (UNIX_TIMESTAMP())
+    )
+  `);
+  // ts is epoch-milliseconds (Date.now()) — needs BIGINT, a 32-bit INT overflows.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id           VARCHAR(64) PRIMARY KEY,
+      room         VARCHAR(64) NOT NULL,
+      wallet       VARCHAR(255),
+      display_name VARCHAR(255),
+      avatar       MEDIUMTEXT,
+      text         TEXT,
+      img_data     MEDIUMTEXT,
+      ts           BIGINT NOT NULL
+    )
+  `);
+  // MySQL has no "CREATE INDEX IF NOT EXISTS" — ignore the duplicate-key-name error.
+  await pool.query('CREATE INDEX idx_chat_room_ts ON chat_messages(room, ts)').catch(e => {
+    if (e.code !== 'ER_DUP_KEYNAME') throw e;
+  });
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS watchlist (
+      id         INT PRIMARY KEY AUTO_INCREMENT,
+      wallet     VARCHAR(255) NOT NULL,
+      address    VARCHAR(255) NOT NULL,
+      chain      VARCHAR(64),
+      name       VARCHAR(255),
+      symbol     VARCHAR(64),
+      image_url  TEXT,
+      added_at   INT DEFAULT (UNIX_TIMESTAMP()),
+      UNIQUE KEY uniq_wallet_address (wallet, address)
+    )
+  `);
 
-// ── User profiles & chat history tables ──────────────────────────────────────
-db.exec(`
-  CREATE TABLE IF NOT EXISTS user_profiles (
-    wallet       TEXT PRIMARY KEY,
-    display_name TEXT,
-    avatar       TEXT,
-    updated_at   INTEGER DEFAULT (strftime('%s','now'))
-  );
-  CREATE TABLE IF NOT EXISTS chat_messages (
-    id           TEXT PRIMARY KEY,
-    room         TEXT NOT NULL,
-    wallet       TEXT,
-    display_name TEXT,
-    avatar       TEXT,
-    text         TEXT,
-    img_data     TEXT,
-    ts           INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_chat_room_ts ON chat_messages(room, ts);
-`);
-
-// Seed default config if not set
-const _caRow = db.prepare("SELECT key FROM app_config WHERE key='contract_address'").get();
-if (!_caRow) db.prepare("INSERT INTO app_config (key, value) VALUES ('contract_address', 'coming_soon')").run();
+  // Seed default config if not set
+  const caRow = await dbGet("SELECT `key` FROM app_config WHERE `key`='contract_address'");
+  if (!caRow) await dbRun("INSERT INTO app_config (`key`, value) VALUES ('contract_address', 'coming_soon')");
+}
 
 // ─── Crypto helpers ─────────────────────────────────────────────────────────────
 function encrypt(text) {
@@ -104,10 +150,6 @@ function decrypt(data) {
   decipher.setAuthTag(Buffer.from(tagHex,'hex'));
   return Buffer.concat([decipher.update(Buffer.from(encHex,'hex')), decipher.final()]).toString('utf8');
 }
-
-// Migrate existing DB — add columns if missing
-try { db.exec(`ALTER TABLE users ADD COLUMN generated_address TEXT`); } catch (_) {}
-try { db.exec(`ALTER TABLE users ADD COLUMN generated_key_enc TEXT`); } catch (_) {}
 
 function hashJwt(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
@@ -2148,10 +2190,9 @@ app.get('/api/trending', async (req, res) => {
   }
 });
 
-// ─── Market Overview: Hybrid DexScreener (trending/volume) + GT (new pairs) ────
+// ─── Market Overview: DexScreener only (trending/volume) — no GeckoTerminal calls ──
 const DASH_CACHE_TTL = (parseInt(process.env.DASHBOARD_TTL_SEC) || 120) * 1000;  // default 2 minutes
 const DASH_CHAINS    = ['ethereum', 'base', 'robinhood'];
-const GT_NET         = { ethereum:'eth', base:'base', robinhood:'robinhood' };
 
 // Cache per key: 'all' | 'ethereum' | 'base' | 'robinhood'
 const _dashCaches   = {};
@@ -2216,38 +2257,12 @@ const _mapDS = p => {
   };
 };
 
-// Map a GeckoTerminal pool to unified format (for new pairs)
-const GT_NET_MAP = { eth:'ethereum', base:'base', robinhood:'robinhood' };
-const _mapGT = p => {
-  const a      = p.attributes || {};
-  const rawNet = p.relationships?.network?.data?.id || p.id?.split('_')[0] || 'unknown';
-  const netId  = GT_NET_MAP[rawNet] || rawNet;
-  if (!SUPPORTED_DASH.has(netId)) return null;
-  const baseAddr = p.relationships?.base_token?.data?.id?.split('_').slice(1).join('_') || '';
-  return {
-    name:          (a.name || '?').replace(/\s+\d+(\.\d+)?%/g, '').trim(),
-    address:       baseAddr,
-    pairAddress:   a.address || '',
-    network:       _dashChainLabel(netId),
-    networkId:     netId,
-    price:         parseFloat(a.base_token_price_usd || 0),
-    priceChange24h:parseFloat(a.price_change_percentage?.h24 || 0),
-    volume24h:     parseFloat(a.volume_usd?.h24 || 0),
-    liquidity:     parseFloat(a.reserve_in_usd || 0),
-    fdv:           parseFloat(a.fdv_usd || 0),
-    createdAt:     a.pool_created_at || null,
-    buys24h:       parseInt(a.transactions?.h24?.buys  || 0),
-    sells24h:      parseInt(a.transactions?.h24?.sells || 0),
-  };
-};
-
 const _dedupe = arr => arr.filter((p, i, a) =>
   p && a.findIndex(x => x && x.pairAddress === p.pairAddress && x.networkId === p.networkId) === i
 );
 
-const _buildPayload = (dsPairs, gtNewRaw, chains) => {
+const _buildPayload = (dsPairs, chains) => {
   const pools  = _dedupe(dsPairs.filter(Boolean));
-  const cutoff = Date.now() - 86400000;
 
   const seenBV = new Set();
   const bestVolume = [...pools]
@@ -2263,12 +2278,7 @@ const _buildPayload = (dsPairs, gtNewRaw, chains) => {
     .filter(p => { const k = `${p.address}_${p.networkId}`; if (seenTR.has(k)) return false; seenTR.add(k); return true; })
     .slice(0, 200);
 
-  const newPairs = _dedupe(gtNewRaw.map(_mapGT).filter(Boolean))
-    .filter(p => p.createdAt && new Date(p.createdAt).getTime() >= cutoff)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-    .slice(0, 200);
-
-  return { success: true, data: { bestVolume, trending, newPairs, chains } };
+  return { success: true, data: { bestVolume, trending, chains } };
 };
 
 const _dsGet = url => axios.get(url, { timeout: 8000 }).catch(() => null);
@@ -2278,7 +2288,6 @@ async function _fetchDash(key) {
   _dashFetching[key] = true;
   try {
     let dsPairs = [];
-    let gtNewRaw = [];
 
     if (key === 'all') {
       // All Chains: DexScreener generic queries + Robinhood-specific queries (tokens differ from other chains)
@@ -2291,7 +2300,8 @@ async function _fetchDash(key) {
         ...robinhoodRes.flatMap(r => (r?.data?.pairs || []).filter(p => p?.chainId === 'robinhood').map(_mapDS)),
       ];
     } else {
-      // Per-chain: DS token addresses + DS searches filtered to chain + 1 GT new_pools
+      // Per-chain: DS token addresses + DS searches filtered to chain
+      // (GeckoTerminal new_pools call removed — not worth the rate-limit cost)
       const addrs   = DS_CHAIN_TOKENS[key] || [];
       const chainSearches = {
         ethereum:  ['weth','pepe','shib','uni','link','aave','crv','mkr'],
@@ -2299,23 +2309,21 @@ async function _fetchDash(key) {
         robinhood: ['robin','cashcat','tendies','wood','home'],
       }[key] || [];
 
-      const [dsAddrRes, dsSearchRes, gtRes] = await Promise.all([
+      const [dsAddrRes, dsSearchRes] = await Promise.all([
         Promise.all(addrs.map(a => _dsGet(`${DEXSCREENER}/latest/dex/tokens/${a}`))),
         Promise.all(chainSearches.map(q => _dsGet(`${DEXSCREENER}/latest/dex/search?q=${q}&chainIds=${key}`))),
-        GT_NET[key] ? _gtGet(`${GECKO}/networks/${GT_NET[key]}/new_pools?page=1`) : Promise.resolve(null),
       ]);
       dsPairs  = [
         ...dsAddrRes.flatMap(r => (r?.data?.pairs || []).filter(p => p?.chainId === key).map(_mapDS)),
         ...dsSearchRes.flatMap(r => (r?.data?.pairs || []).filter(p => p?.chainId === key).map(_mapDS)),
       ].filter(p => p && p.networkId === key);
-      gtNewRaw = gtRes?.data?.data || [];
     }
 
-    const payload = _buildPayload(dsPairs, gtNewRaw, key === 'all' ? DASH_CHAINS : [key]);
+    const payload = _buildPayload(dsPairs, key === 'all' ? DASH_CHAINS : [key]);
     const hasData = payload.data.bestVolume.length > 0 || payload.data.trending.length > 0;
     if (hasData) {
       _dashCaches[key] = { payload, at: Date.now() };
-      console.log(`[dash:${key}] BV=${payload.data.bestVolume.length} TR=${payload.data.trending.length} NP=${payload.data.newPairs.length}`);
+      console.log(`[dash:${key}] BV=${payload.data.bestVolume.length} TR=${payload.data.trending.length}`);
     } else {
       // Cache empty result to avoid repeated 503s for chains not yet indexed
       _dashCaches[key] = { payload: { ...payload, empty: true }, at: Date.now() };
@@ -2546,7 +2554,7 @@ function _botSvgCard(info) {
   return 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64');
 }
 
-function _botSend(roomKey, text, imgData = null) {
+async function _botSend(roomKey, text, imgData = null) {
   const entry = {
     id:   Date.now() + Math.random().toString(36).slice(2,6),
     room: roomKey,
@@ -2558,8 +2566,8 @@ function _botSend(roomKey, text, imgData = null) {
     ts: Date.now(),
     isBot: true,
   };
-  db.prepare(`INSERT OR IGNORE INTO chat_messages (id,room,wallet,display_name,avatar,text,img_data,ts)
-    VALUES (?,?,?,?,?,?,?,?)`).run(entry.id, entry.room, entry.wallet, entry.displayName, entry.avatar, entry.text, entry.imgData, entry.ts);
+  await dbRun(`INSERT IGNORE INTO chat_messages (id,room,wallet,display_name,avatar,text,img_data,ts)
+    VALUES (?,?,?,?,?,?,?,?)`, [entry.id, entry.room, entry.wallet, entry.displayName, entry.avatar, entry.text, entry.imgData, entry.ts]);
   broadcastChat(roomKey, { type: 'chat_msg', msg: entry, online: onlineCount() });
 }
 
@@ -2576,7 +2584,7 @@ async function _chatBotAnalyze(ca, roomKey) {
       .filter(p => BOT_CHAINS.has(p.chainId))
       .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
     if (!pairs.length) {
-      _botSend(roomKey, `🔎 I spotted a contract address but couldn't find that token on a supported EVM chain (Ethereum, Base, Arbitrum, Polygon, Optimism, Robinhood).`);
+      await _botSend(roomKey, `🔎 I spotted a contract address but couldn't find that token on a supported EVM chain (Ethereum, Base, Arbitrum, Polygon, Optimism, Robinhood).`);
       return;
     }
     const p = pairs[0];
@@ -2617,7 +2625,7 @@ async function _chatBotAnalyze(ca, roomKey) {
       `AI Prediction: ${signal} · ${confidence}% confidence\n` +
       `MCap ${_botFmtUsd(info.marketCap)} · Liq ${_botFmtUsd(info.liquidity)} · Vol24h ${_botFmtUsd(info.volume24h)} · Buys ${buyRatio}%`;
 
-    _botSend(roomKey, text, _botSvgCard(info));
+    await _botSend(roomKey, text, _botSvgCard(info));
   } catch (e) {
     console.error('[chatbot]', e.message);
   }
@@ -2640,7 +2648,7 @@ wss.on('connection', (ws) => {
       if (msg.type === 'chat_join') {
         const wallet = msg.wallet || null;
         // Load profile from DB for avatar + saved name
-        const profile = wallet ? db.prepare('SELECT display_name, avatar FROM user_profiles WHERE wallet=?').get(wallet) : null;
+        const profile = wallet ? await dbGet('SELECT display_name, avatar FROM user_profiles WHERE wallet=?', [wallet]) : null;
         const displayName = profile?.display_name || msg.displayName || shortAddr(wallet) || 'Anon#' + Math.floor(Math.random() * 9999);
         const avatar = profile?.avatar || null;
         chatUsers.set(ws, { wallet, displayName, avatar, joinedAt: Date.now() });
@@ -2654,7 +2662,7 @@ wss.on('connection', (ws) => {
             gates[k] = g;
             if (!g.ok) { history[k] = []; continue; }
           }
-          const rows = db.prepare('SELECT * FROM chat_messages WHERE room=? ORDER BY ts DESC LIMIT ?').all(k, MAX_CHAT_HISTORY);
+          const rows = await dbAll('SELECT * FROM chat_messages WHERE room=? ORDER BY ts DESC LIMIT ?', [k, MAX_CHAT_HISTORY]);
           history[k] = rows.reverse().map(r => ({
             id: r.id, room: r.room, wallet: r.wallet, displayName: r.display_name,
             avatar: r.avatar, text: r.text, imgData: r.img_data, ts: r.ts,
@@ -2696,11 +2704,14 @@ wss.on('connection', (ws) => {
           ts: Date.now(),
         };
         // Persist to DB
-        db.prepare(`INSERT OR IGNORE INTO chat_messages (id,room,wallet,display_name,avatar,text,img_data,ts)
-          VALUES (?,?,?,?,?,?,?,?)`).run(entry.id, entry.room, entry.wallet, entry.displayName, entry.avatar, entry.text, entry.imgData, entry.ts);
-        // Prune old messages per room (keep last CHAT_DB_PRUNE_LIMIT)
-        db.prepare(`DELETE FROM chat_messages WHERE room=? AND id NOT IN
-          (SELECT id FROM chat_messages WHERE room=? ORDER BY ts DESC LIMIT ?)`).run(entry.room, entry.room, CONFIG.chatDbPruneLimit);
+        await dbRun(`INSERT IGNORE INTO chat_messages (id,room,wallet,display_name,avatar,text,img_data,ts)
+          VALUES (?,?,?,?,?,?,?,?)`, [entry.id, entry.room, entry.wallet, entry.displayName, entry.avatar, entry.text, entry.imgData, entry.ts]);
+        // Prune old messages per room (keep last CHAT_DB_PRUNE_LIMIT). The inner
+        // SELECT is wrapped in a derived table because MySQL forbids selecting
+        // from the same table being deleted from directly in a subquery.
+        await dbRun(`DELETE FROM chat_messages WHERE room=? AND id NOT IN
+          (SELECT id FROM (SELECT id FROM chat_messages WHERE room=? ORDER BY ts DESC LIMIT ?) AS keep)`,
+          [entry.room, entry.room, CONFIG.chatDbPruneLimit]);
         broadcastChat(msg.room, { type: 'chat_msg', msg: entry, online: onlineCount() });
 
         // Bot: detect a contract address in the message and auto-analyze it
@@ -2716,8 +2727,8 @@ wss.on('connection', (ws) => {
         const name = String(msg.name || '').trim().slice(0, CONFIG.chatNameMaxLen);
         if (name) {
           user.displayName = name;
-          if (user.wallet) db.prepare(`INSERT INTO user_profiles (wallet,display_name,avatar,updated_at) VALUES (?,?,?,strftime('%s','now'))
-            ON CONFLICT(wallet) DO UPDATE SET display_name=excluded.display_name, updated_at=excluded.updated_at`).run(user.wallet, name, user.avatar || null);
+          if (user.wallet) await dbRun(`INSERT INTO user_profiles (wallet,display_name,avatar,updated_at) VALUES (?,?,?,UNIX_TIMESTAMP())
+            ON DUPLICATE KEY UPDATE display_name=VALUES(display_name), updated_at=VALUES(updated_at)`, [user.wallet, name, user.avatar || null]);
         }
         ws.send(JSON.stringify({ type: 'chat_nameok', displayName: user.displayName }));
         return;
@@ -3078,14 +3089,14 @@ app.post('/api/wallet-tracker', async (req, res) => {
 });
 
 // ─── Auth middleware ────────────────────────────────────────────────────────────
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const token = req.cookies?.bb_token || req.headers['authorization']?.replace('Bearer ','');
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     // Check session still valid in DB
     const hash = hashJwt(token);
-    const session = db.prepare('SELECT * FROM sessions WHERE jwt_hash=? AND expires_at>?').get(hash, Math.floor(Date.now()/1000));
+    const session = await dbGet('SELECT * FROM sessions WHERE jwt_hash=? AND expires_at>?', [hash, Math.floor(Date.now()/1000)]);
     if (!session) return res.status(401).json({ error: 'Session expired' });
     req.user = payload;
     next();
@@ -3115,7 +3126,7 @@ app.post('/api/auth/login', async (req, res) => {
     let generatedAddress = null;
     let generatedKeyEnc  = null;
     if (isEmail) {
-      const existing = db.prepare('SELECT generated_address, generated_key_enc FROM users WHERE wallet=?').get(walletLower);
+      const existing = await dbGet('SELECT generated_address, generated_key_enc FROM users WHERE wallet=?', [walletLower]);
       if (existing?.generated_address) {
         generatedAddress = existing.generated_address;
       } else {
@@ -3126,17 +3137,17 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     // Upsert user
-    db.prepare(`
+    await dbRun(`
       INSERT INTO users (wallet, wallet_enc, generated_address, generated_key_enc, meta, last_login)
       VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(wallet) DO UPDATE SET
-        last_login=excluded.last_login,
-        meta=COALESCE(excluded.meta, meta),
-        generated_address=COALESCE(users.generated_address, excluded.generated_address),
-        generated_key_enc=COALESCE(users.generated_key_enc, excluded.generated_key_enc)
-    `).run(walletLower, walletEnc, generatedAddress, generatedKeyEnc, metaStr, now);
+      ON DUPLICATE KEY UPDATE
+        last_login=VALUES(last_login),
+        meta=COALESCE(VALUES(meta), meta),
+        generated_address=COALESCE(generated_address, VALUES(generated_address)),
+        generated_key_enc=COALESCE(generated_key_enc, VALUES(generated_key_enc))
+    `, [walletLower, walletEnc, generatedAddress, generatedKeyEnc, metaStr, now]);
 
-    const user = db.prepare('SELECT * FROM users WHERE wallet=?').get(walletLower);
+    const user = await dbGet('SELECT * FROM users WHERE wallet=?', [walletLower]);
     const displayAddress = isEmail ? user.generated_address : walletLower;
 
     // Issue JWT (7 days)
@@ -3148,8 +3159,8 @@ app.post('/api/auth/login', async (req, res) => {
     );
 
     // Store hashed token in sessions table
-    db.prepare('INSERT INTO sessions (wallet, jwt_hash, expires_at) VALUES (?,?,?)').run(
-      walletLower, hashJwt(token), now + expiresIn
+    await dbRun('INSERT INTO sessions (wallet, jwt_hash, expires_at) VALUES (?,?,?)',
+      [walletLower, hashJwt(token), now + expiresIn]
     );
 
     // Set httpOnly cookie (7 days)
@@ -3168,61 +3179,48 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ─── GET /api/auth/me ───────────────────────────────────────────────────────────
-app.get('/api/auth/me', requireAuth, (req, res) => {
-  const user = db.prepare('SELECT id, wallet, generated_address, created_at, last_login FROM users WHERE wallet=?').get(req.user.wallet);
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  const user = await dbGet('SELECT id, wallet, generated_address, created_at, last_login FROM users WHERE wallet=?', [req.user.wallet]);
   if (!user) return res.status(404).json({ error: 'User not found' });
   return res.json({ success: true, user });
 });
 
 // ─── POST /api/auth/logout ──────────────────────────────────────────────────────
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
   const token = req.cookies?.bb_token;
   if (token) {
-    db.prepare('DELETE FROM sessions WHERE jwt_hash=?').run(hashJwt(token));
+    await dbRun('DELETE FROM sessions WHERE jwt_hash=?', [hashJwt(token)]);
   }
   res.clearCookie('bb_token', { path: '/' });
   return res.json({ success: true });
 });
 
 // ─── Watchlist ────────────────────────────────────────────────────────────────
-db.exec(`
-  CREATE TABLE IF NOT EXISTS watchlist (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    wallet     TEXT NOT NULL,
-    address    TEXT NOT NULL,
-    chain      TEXT,
-    name       TEXT,
-    symbol     TEXT,
-    added_at   INTEGER DEFAULT (strftime('%s','now')),
-    UNIQUE(wallet, address)
-  )
-`);
+// (table created in initDb())
 
-app.get('/api/watchlist', requireAuth, (req, res) => {
-  const rows = db.prepare('SELECT * FROM watchlist WHERE wallet=? ORDER BY added_at DESC').all(req.user.wallet);
+app.get('/api/watchlist', requireAuth, async (req, res) => {
+  const rows = await dbAll('SELECT * FROM watchlist WHERE wallet=? ORDER BY added_at DESC', [req.user.wallet]);
   res.json({ success: true, items: rows });
 });
 
-app.get('/api/watchlist/check/:address', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT id FROM watchlist WHERE wallet=? AND address=?').get(req.user.wallet, req.params.address.toLowerCase());
+app.get('/api/watchlist/check/:address', requireAuth, async (req, res) => {
+  const row = await dbGet('SELECT id FROM watchlist WHERE wallet=? AND address=?', [req.user.wallet, req.params.address.toLowerCase()]);
   res.json({ inWatchlist: !!row });
 });
 
-app.post('/api/watchlist', requireAuth, (req, res) => {
+app.post('/api/watchlist', requireAuth, async (req, res) => {
   const { address, chain, name, symbol, imageUrl } = req.body;
   if (!address) return res.status(400).json({ error: 'address required' });
-  // Add image_url column if missing (safe to run repeatedly)
-  try { db.prepare('ALTER TABLE watchlist ADD COLUMN image_url TEXT').run(); } catch (_) {}
-  db.prepare(`
+  await dbRun(`
     INSERT INTO watchlist (wallet, address, chain, name, symbol, image_url)
     VALUES (?,?,?,?,?,?)
-    ON CONFLICT(wallet, address) DO UPDATE SET chain=excluded.chain, name=excluded.name, symbol=excluded.symbol, image_url=excluded.image_url
-  `).run(req.user.wallet, address.toLowerCase(), chain || '', name || '', symbol || '', imageUrl || null);
+    ON DUPLICATE KEY UPDATE chain=VALUES(chain), name=VALUES(name), symbol=VALUES(symbol), image_url=VALUES(image_url)
+  `, [req.user.wallet, address.toLowerCase(), chain || '', name || '', symbol || '', imageUrl || null]);
   res.json({ success: true });
 });
 
-app.delete('/api/watchlist/:address', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM watchlist WHERE wallet=? AND address=?').run(req.user.wallet, req.params.address.toLowerCase());
+app.delete('/api/watchlist/:address', requireAuth, async (req, res) => {
+  await dbRun('DELETE FROM watchlist WHERE wallet=? AND address=?', [req.user.wallet, req.params.address.toLowerCase()]);
   res.json({ success: true });
 });
 
@@ -3616,30 +3614,30 @@ app.get('/api/wallet-map/:address', async (req, res) => {
 });
 
 // ─── User profile endpoints ──────────────────────────────────────────────────
-app.get('/api/profile/:wallet', (req, res) => {
-  const row = db.prepare('SELECT wallet, display_name, avatar FROM user_profiles WHERE wallet=?').get(req.params.wallet);
+app.get('/api/profile/:wallet', async (req, res) => {
+  const row = await dbGet('SELECT wallet, display_name, avatar FROM user_profiles WHERE wallet=?', [req.params.wallet]);
   if (!row) return res.json({ found: false });
   res.json({ found: true, displayName: row.display_name, avatar: row.avatar });
 });
 
-app.post('/api/profile', express.json({ limit: '8mb' }), (req, res) => {
+app.post('/api/profile', express.json({ limit: '8mb' }), async (req, res) => {
   const { wallet, displayName, avatar } = req.body || {};
   if (!wallet) return res.status(400).json({ error: 'wallet required' });
   if (avatar && avatar.length > 7 * 1024 * 1024) return res.status(400).json({ error: 'avatar too large' });
-  db.prepare(`
+  await dbRun(`
     INSERT INTO user_profiles (wallet, display_name, avatar, updated_at)
-    VALUES (?, ?, ?, strftime('%s','now'))
-    ON CONFLICT(wallet) DO UPDATE SET
-      display_name = excluded.display_name,
-      avatar       = excluded.avatar,
-      updated_at   = excluded.updated_at
-  `).run(wallet, displayName || null, avatar || null);
+    VALUES (?, ?, ?, UNIX_TIMESTAMP())
+    ON DUPLICATE KEY UPDATE
+      display_name = VALUES(display_name),
+      avatar       = VALUES(avatar),
+      updated_at   = VALUES(updated_at)
+  `, [wallet, displayName || null, avatar || null]);
   res.json({ ok: true });
 });
 
 // ─── Public config endpoint ─────────────────────────────────────────────────
-app.get('/api/config/public', (req, res) => {
-  const ca = db.prepare("SELECT value FROM app_config WHERE key='contract_address'").get();
+app.get('/api/config/public', async (req, res) => {
+  const ca = await dbGet("SELECT value FROM app_config WHERE `key`='contract_address'");
   res.json({
     contractAddress: ca?.value || 'coming_soon',
     networkEnv: NETWORK_ENV,
@@ -3770,4 +3768,12 @@ app.get('/api/trade/quote/evm', async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Bloombark Terminal Backend running on port ${PORT}`));
+// Ensure the MySQL schema exists before accepting traffic
+initDb()
+  .then(() => {
+    server.listen(PORT, () => console.log(`Bloombark Terminal Backend running on port ${PORT}`));
+  })
+  .catch((e) => {
+    console.error('[db] Failed to initialize MySQL schema:', e.message);
+    process.exit(1);
+  });
