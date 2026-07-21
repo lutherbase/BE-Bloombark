@@ -3690,6 +3690,45 @@ app.get('/api/config/public', async (req, res) => {
   });
 });
 
+// ─── Read-only admin DB query (for inspecting the DB when a direct connection
+// isn't possible, e.g. TLS blocked on a local network). Disabled unless
+// ADMIN_QUERY_TOKEN is set. Only SELECT/SHOW/DESCRIBE/EXPLAIN are allowed; a
+// single statement at a time; results capped. Never mutates data. ────────────
+const ADMIN_QUERY_TOKEN = process.env.ADMIN_QUERY_TOKEN || '';
+const ADMIN_QUERY_MAX_ROWS = parseInt(process.env.ADMIN_QUERY_MAX_ROWS) || 500;
+
+function _isReadOnlySql(sql) {
+  const s = String(sql || '').trim().replace(/;\s*$/, ''); // drop one trailing ;
+  if (!s) return false;
+  if (s.includes(';')) return false;                       // no stacked statements
+  if (/\/\*|--/.test(s)) return false;                     // no comment-based tricks
+  const first = s.split(/\s+/)[0].toLowerCase();
+  return ['select', 'show', 'describe', 'desc', 'explain', 'with'].includes(first);
+}
+
+app.get('/api/admin/query', async (req, res) => {
+  if (!ADMIN_QUERY_TOKEN) return res.status(404).json({ error: 'not enabled' });
+  const token = req.get('x-admin-token') || req.query.token || '';
+  if (token !== ADMIN_QUERY_TOKEN) return res.status(403).json({ error: 'forbidden' });
+
+  const sql = req.query.sql;
+  if (!_isReadOnlySql(sql)) {
+    return res.status(400).json({ error: 'only a single read-only statement (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH) is allowed' });
+  }
+  try {
+    const rows = await dbAll(sql);
+    const capped = Array.isArray(rows) ? rows.slice(0, ADMIN_QUERY_MAX_ROWS) : rows;
+    res.json({
+      ok: true,
+      rowCount: Array.isArray(rows) ? rows.length : undefined,
+      truncated: Array.isArray(rows) && rows.length > ADMIN_QUERY_MAX_ROWS,
+      rows: capped,
+    });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
 // ─── Trading proxy (KyberSwap aggregator, EVM only) ─────────────────────────
 // Note: KyberSwap does not index testnet liquidity — quotes/swaps will return
 // no route in testnet mode. This mapping is left as mainnet-only slugs.
