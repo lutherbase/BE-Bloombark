@@ -39,6 +39,15 @@ const ENC_KEY    = process.env.ENC_KEY    || _secrets.ENC_KEY;
 // bundle (e.g. Aiven's ca.pem) when the server cert isn't in the system trust
 // store; otherwise we just validate against the system CAs.
 const DB_SSL = (process.env.DB_SSL || 'true').toLowerCase() !== 'false';
+function _loadDbCa() {
+  if (!process.env.DB_SSL_CA) return {};
+  // Normalize CRLF and stray whitespace — a mismatched line-ending or trimmed
+  // trailing newline from copy/pasting into a host's secret-file UI is enough
+  // to make OpenSSL reject the whole chain as self-signed/untrusted.
+  const raw = fs.readFileSync(process.env.DB_SSL_CA, 'utf8').replace(/\r\n/g, '\n').trim() + '\n';
+  console.log(`[db] Loaded SSL CA from ${process.env.DB_SSL_CA} (${raw.length} bytes)`);
+  return { ca: raw };
+}
 const pool = mysql.createPool({
   host:     process.env.DB_HOST || '127.0.0.1',
   port:     parseInt(process.env.DB_PORT) || 3306,
@@ -49,7 +58,7 @@ const pool = mysql.createPool({
   connectionLimit: parseInt(process.env.DB_POOL_SIZE) || 10,
   queueLimit: 0,
   ssl: !DB_SSL ? undefined : {
-    ...(process.env.DB_SSL_CA ? { ca: fs.readFileSync(process.env.DB_SSL_CA, 'utf8') } : {}),
+    ..._loadDbCa(),
     rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false',
   },
 });
