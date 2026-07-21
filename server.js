@@ -258,7 +258,7 @@ const CONFIG = {
   chatHistoryLimit:      parseInt(process.env.CHAT_HISTORY_LIMIT)    || 100,
   chatDbPruneLimit:      parseInt(process.env.CHAT_DB_PRUNE_LIMIT)   || 500,
   chatMsgMaxLen:         parseInt(process.env.CHAT_MSG_MAX_LEN)      || 500,
-  chatNameMaxLen:        parseInt(process.env.CHAT_NAME_MAX_LEN)     || 24,
+  chatNameMaxLen:        parseInt(process.env.CHAT_NAME_MAX_LEN)     || 15,
   chatBotCooldownMs:     (parseInt(process.env.CHAT_BOT_COOLDOWN_SEC) || 120) * 1000,
 
   // Simulated live price ticker
