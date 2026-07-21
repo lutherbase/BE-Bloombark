@@ -3,3 +3,7 @@ node_modules/
 .env.example
 .env.local
 *.pem
+
+# CA cert is public info (not a secret) — committed intentionally so
+# DB_SSL_CA can point at a relative path without relying on a host UI paste.
+!aiven-ca.pem
