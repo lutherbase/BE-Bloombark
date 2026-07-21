@@ -2494,7 +2494,12 @@ function _botFmtUsd(v) {
 function _botFmtPrice(p) {
   p = parseFloat(p) || 0;
   if (p === 0) return '$0';
-  if (p < 0.0001) return '$' + p.toExponential(3);
+  if (p < 0.0001) {
+    // Very small prices: show 4 significant digits in fixed notation instead of
+    // scientific notation (e.g. $0.000004492, not $4.492e-6).
+    const leadZeros = (p.toFixed(20).match(/^0\.(0*)/) || [,''])[1].length;
+    return '$' + p.toFixed(Math.min(leadZeros + 4, 18));
+  }
   if (p < 1) return '$' + p.toFixed(6);
   return '$' + p.toLocaleString('en-US', { maximumFractionDigits: 4 });
 }
