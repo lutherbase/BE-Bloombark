@@ -123,6 +123,13 @@ async function initDb() {
   await pool.query('CREATE INDEX idx_chat_room_ts ON chat_messages(room, ts)').catch(e => {
     if (e.code !== 'ER_DUP_KEYNAME') throw e;
   });
+  // Reply/edit support — added after the fact, so ALTER existing tables in place.
+  // MySQL has no "ADD COLUMN IF NOT EXISTS"; ignore the duplicate-column error.
+  const _addCol = sql => pool.query(sql).catch(e => { if (e.code !== 'ER_DUP_FIELDNAME') throw e; });
+  await _addCol('ALTER TABLE chat_messages ADD COLUMN reply_to VARCHAR(64)');
+  await _addCol('ALTER TABLE chat_messages ADD COLUMN reply_name VARCHAR(255)');
+  await _addCol('ALTER TABLE chat_messages ADD COLUMN reply_text VARCHAR(280)');
+  await _addCol('ALTER TABLE chat_messages ADD COLUMN edited TINYINT NOT NULL DEFAULT 0');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS watchlist (
       id         INT PRIMARY KEY AUTO_INCREMENT,
@@ -2598,7 +2605,7 @@ function _botSvgCard(info) {
   return 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64');
 }
 
-async function _botSend(roomKey, text, imgData = null) {
+async function _botSend(roomKey, text, imgData = null, reply = null) {
   const entry = {
     id:   Date.now() + Math.random().toString(36).slice(2,6),
     room: roomKey,
@@ -2609,13 +2616,16 @@ async function _botSend(roomKey, text, imgData = null) {
     imgData,
     ts: Date.now(),
     isBot: true,
+    replyTo:   reply?.id   || null,
+    replyName: reply?.name || null,
+    replyText: reply?.text || null,
   };
-  await dbRun(`INSERT IGNORE INTO chat_messages (id,room,wallet,display_name,avatar,text,img_data,ts)
-    VALUES (?,?,?,?,?,?,?,?)`, [entry.id, entry.room, entry.wallet, entry.displayName, entry.avatar, entry.text, entry.imgData, entry.ts]);
+  await dbRun(`INSERT IGNORE INTO chat_messages (id,room,wallet,display_name,avatar,text,img_data,ts,reply_to,reply_name,reply_text)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`, [entry.id, entry.room, entry.wallet, entry.displayName, entry.avatar, entry.text, entry.imgData, entry.ts, entry.replyTo, entry.replyName, entry.replyText]);
   broadcastChat(roomKey, { type: 'chat_msg', msg: entry, online: onlineCount() });
 }
 
-async function _chatBotAnalyze(ca, roomKey) {
+async function _chatBotAnalyze(ca, roomKey, reply = null) {
   // Cooldown: don't re-analyze the same CA more than once per 2 minutes
   const last = _botCooldown.get(ca.toLowerCase());
   if (last && Date.now() - last < CONFIG.chatBotCooldownMs) return;
@@ -2628,7 +2638,7 @@ async function _chatBotAnalyze(ca, roomKey) {
       .filter(p => BOT_CHAINS.has(p.chainId))
       .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
     if (!pairs.length) {
-      await _botSend(roomKey, `🔎 I spotted a contract address but couldn't find that token on a supported EVM chain (Ethereum, Base, Arbitrum, Polygon, Optimism, Robinhood).`);
+      await _botSend(roomKey, `🔎 I spotted a contract address but couldn't find that token on a supported EVM chain (Ethereum, Base, Arbitrum, Polygon, Optimism, Robinhood).`, null, reply);
       return;
     }
     const p = pairs[0];
@@ -2669,7 +2679,7 @@ async function _chatBotAnalyze(ca, roomKey) {
       `AI Prediction: ${signal} · ${confidence}% confidence\n` +
       `MCap ${_botFmtUsd(info.marketCap)} · Liq ${_botFmtUsd(info.liquidity)} · Vol24h ${_botFmtUsd(info.volume24h)} · Buys ${buyRatio}%`;
 
-    await _botSend(roomKey, text, _botSvgCard(info));
+    await _botSend(roomKey, text, _botSvgCard(info), reply);
   } catch (e) {
     console.error('[chatbot]', e.message);
   }
@@ -2710,6 +2720,9 @@ wss.on('connection', (ws) => {
           history[k] = rows.reverse().map(r => ({
             id: r.id, room: r.room, wallet: r.wallet, displayName: r.display_name,
             avatar: r.avatar, text: r.text, imgData: r.img_data, ts: r.ts,
+            isBot: r.display_name === BOT_NAME && r.wallet == null,
+            replyTo: r.reply_to, replyName: r.reply_name, replyText: r.reply_text,
+            edited: !!r.edited,
           }));
         }
         ws.send(JSON.stringify({ type: 'chat_history', history, gates, online: onlineCount() }));
@@ -2737,6 +2750,16 @@ wss.on('connection', (ws) => {
           && msg.imgData.length < 800000
           ? msg.imgData : null;
         if (!text && !imgData) return;
+        // Reply target: resolve from DB so the snippet can't be spoofed by the client.
+        let replyTo = null, replyName = null, replyText = null;
+        if (msg.replyTo) {
+          const tgt = await dbGet('SELECT id, display_name, text, img_data FROM chat_messages WHERE id=? AND room=?', [String(msg.replyTo), msg.room]);
+          if (tgt) {
+            replyTo   = tgt.id;
+            replyName = tgt.display_name || 'Anon';
+            replyText = (tgt.text || (tgt.img_data ? '📷 image' : '')).slice(0, 120);
+          }
+        }
         const entry = {
           id:   Date.now() + Math.random().toString(36).slice(2,6),
           room: msg.room,
@@ -2746,10 +2769,11 @@ wss.on('connection', (ws) => {
           text,
           imgData,
           ts: Date.now(),
+          replyTo, replyName, replyText,
         };
         // Persist to DB
-        await dbRun(`INSERT IGNORE INTO chat_messages (id,room,wallet,display_name,avatar,text,img_data,ts)
-          VALUES (?,?,?,?,?,?,?,?)`, [entry.id, entry.room, entry.wallet, entry.displayName, entry.avatar, entry.text, entry.imgData, entry.ts]);
+        await dbRun(`INSERT IGNORE INTO chat_messages (id,room,wallet,display_name,avatar,text,img_data,ts,reply_to,reply_name,reply_text)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?)`, [entry.id, entry.room, entry.wallet, entry.displayName, entry.avatar, entry.text, entry.imgData, entry.ts, entry.replyTo, entry.replyName, entry.replyText]);
         // Prune old messages per room (keep last CHAT_DB_PRUNE_LIMIT). The inner
         // SELECT is wrapped in a derived table because MySQL forbids selecting
         // from the same table being deleted from directly in a subquery.
@@ -2758,9 +2782,13 @@ wss.on('connection', (ws) => {
           [entry.room, entry.room, CONFIG.chatDbPruneLimit]);
         broadcastChat(msg.room, { type: 'chat_msg', msg: entry, online: onlineCount() });
 
-        // Bot: detect a contract address in the message and auto-analyze it
+        // Bot: detect a contract address in the message and auto-analyze it —
+        // the bot's answer is threaded as a reply to this message.
         const caMatch = text.match(/0x[a-fA-F0-9]{40}/);
-        if (caMatch) _chatBotAnalyze(caMatch[0], msg.room).catch(() => {});
+        if (caMatch) {
+          const botReply = { id: entry.id, name: entry.displayName, text: (text || '📷 image').slice(0, 120) };
+          _chatBotAnalyze(caMatch[0], msg.room, botReply).catch(() => {});
+        }
         return;
       }
 
@@ -2775,6 +2803,30 @@ wss.on('connection', (ws) => {
             ON DUPLICATE KEY UPDATE display_name=VALUES(display_name), updated_at=VALUES(updated_at)`, [user.wallet, name, user.avatar || null]);
         }
         ws.send(JSON.stringify({ type: 'chat_nameok', displayName: user.displayName }));
+        return;
+      }
+
+      // ── chat: edit own message ──
+      if (msg.type === 'chat_edit') {
+        const user = chatUsers.get(ws);
+        if (!user || !user.wallet) return;                 // must be a wallet-identified user
+        const row = await dbGet('SELECT id, room, wallet, img_data FROM chat_messages WHERE id=?', [String(msg.id || '')]);
+        if (!row || row.wallet !== user.wallet) return;    // own messages only
+        const text = String(msg.text || '').trim().slice(0, CONFIG.chatMsgMaxLen);
+        if (!text && !row.img_data) return;                // don't allow blanking a text-only message
+        await dbRun('UPDATE chat_messages SET text=?, edited=1 WHERE id=?', [text, row.id]);
+        broadcastChat(row.room, { type: 'chat_edited', id: row.id, room: row.room, text });
+        return;
+      }
+
+      // ── chat: delete own message ──
+      if (msg.type === 'chat_delete') {
+        const user = chatUsers.get(ws);
+        if (!user || !user.wallet) return;
+        const row = await dbGet('SELECT id, room, wallet FROM chat_messages WHERE id=?', [String(msg.id || '')]);
+        if (!row || row.wallet !== user.wallet) return;    // own messages only
+        await dbRun('DELETE FROM chat_messages WHERE id=?', [row.id]);
+        broadcastChat(row.room, { type: 'chat_deleted', id: row.id, room: row.room });
         return;
       }
 
