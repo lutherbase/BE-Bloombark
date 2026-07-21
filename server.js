@@ -2345,22 +2345,52 @@ async function _fetchDash(key) {
   }
 }
 
+// Derive a single-chain view by filtering the reliably-warmed 'all' dataset.
+// The old approach did a separate per-chain DexScreener fetch using
+// `&chainIds=<chain>`, but DexScreener now ignores that filter, so those fetches
+// frequently came back empty and got cached as "chain not yet indexed" for the
+// full TTL (per-chain caches were never re-warmed). The 'all' dataset already
+// contains every supported chain, so filtering it is both reliable and cheaper.
+function _deriveChainPayload(key) {
+  const all = _dashCaches['all'];
+  if (!all) return null;
+  const d = all.payload.data || { bestVolume: [], trending: [] };
+  return {
+    success: true,
+    data: {
+      bestVolume: d.bestVolume.filter(p => p.networkId === key),
+      trending:   d.trending.filter(p => p.networkId === key),
+      chains:     [key],
+    },
+  };
+}
+
 app.get('/api/dashboard', async (req, res) => {
-  const key    = DASH_CHAINS.includes(req.query.chain) ? req.query.chain : 'all';
-  const cached = _dashCaches[key];
-  if (cached && Date.now() - cached.at < DASH_CACHE_TTL) {
-    return res.json(cached.payload);
-  }
-  _fetchDash(key);
+  const key = DASH_CHAINS.includes(req.query.chain) ? req.query.chain : 'all';
+
+  // 'all' is the single source of truth for every view — make sure it's warm.
+  const allCached = _dashCaches['all'];
+  if (!allCached || Date.now() - allCached.at >= DASH_CACHE_TTL) _fetchDash('all');
+
+  // Wait briefly for 'all' on a cold start.
   const deadline = Date.now() + 15000;
-  while (!_dashCaches[key] && Date.now() < deadline) {
+  while (!_dashCaches['all'] && Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 300));
   }
-  if (_dashCaches[key]) return res.json(_dashCaches[key].payload);
-  res.status(503).json({ error: 'Dashboard data not yet available, please retry' });
+  if (!_dashCaches['all']) {
+    return res.status(503).json({ error: 'Dashboard data not yet available, please retry' });
+  }
+
+  if (key === 'all') return res.json(_dashCaches['all'].payload);
+
+  // Per-chain: filter the 'all' dataset. Empty here means that chain genuinely
+  // has no pools in the current set (rare) — not a failed/rate-limited fetch.
+  const payload = _deriveChainPayload(key);
+  const hasData = payload.data.bestVolume.length > 0 || payload.data.trending.length > 0;
+  return res.json(hasData ? payload : { ...payload, empty: true });
 });
 
-// Pre-warm "all" on startup; per-chain loaded on demand
+// Pre-warm "all" on startup and keep it fresh; per-chain views derive from it.
 setTimeout(() => _fetchDash('all'), CONFIG.dashWarmDelayMs);
 setInterval(() => _fetchDash('all'), DASH_CACHE_TTL);
 
