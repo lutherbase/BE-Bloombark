@@ -170,6 +170,9 @@ async function initDb() {
   // Seed default config if not set
   const caRow = await dbGet("SELECT `key` FROM app_config WHERE `key`='contract_address'");
   if (!caRow) await dbRun("INSERT INTO app_config (`key`, value) VALUES ('contract_address', 'coming_soon')");
+  // Token ticker (shown on the landing page). Editable in the DB at launch.
+  const tickerRow = await dbGet("SELECT `key` FROM app_config WHERE `key`='token_ticker'");
+  if (!tickerRow) await dbRun("INSERT INTO app_config (`key`, value) VALUES ('token_ticker', 'BBRK')");
 }
 
 // ─── Crypto helpers ─────────────────────────────────────────────────────────────
@@ -3884,9 +3887,13 @@ app.post('/api/profile', express.json({ limit: '8mb' }), async (req, res) => {
 
 // ─── Public config endpoint ─────────────────────────────────────────────────
 app.get('/api/config/public', async (req, res) => {
-  const ca = await dbGet("SELECT value FROM app_config WHERE `key`='contract_address'");
+  const [ca, ticker] = await Promise.all([
+    dbGet("SELECT value FROM app_config WHERE `key`='contract_address'"),
+    dbGet("SELECT value FROM app_config WHERE `key`='token_ticker'"),
+  ]);
   res.json({
     contractAddress: ca?.value || 'coming_soon',
+    tokenTicker: ticker?.value || 'BBRK',
     networkEnv: NETWORK_ENV,
     isTestnet: IS_TESTNET,
     chains: Object.fromEntries(Object.keys(CHAIN_NETWORKS).map(k => [k, chainCfg(k)])),
