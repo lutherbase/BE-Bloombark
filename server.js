@@ -143,6 +143,29 @@ async function initDb() {
       UNIQUE KEY uniq_wallet_address (wallet, address)
     )
   `);
+  // Community: paid-channel unlocks (one-time on-chain payment, verified then recorded here)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS channel_payments (
+      id         INT PRIMARY KEY AUTO_INCREMENT,
+      wallet     VARCHAR(255) NOT NULL,
+      room       VARCHAR(64) NOT NULL,
+      tx_hash    VARCHAR(80) NOT NULL,
+      amount_eth DECIMAL(20,10) NOT NULL,
+      paid_at    INT DEFAULT (UNIX_TIMESTAMP()),
+      UNIQUE KEY uniq_tx_hash (tx_hash),
+      KEY idx_wallet_room (wallet, room)
+    )
+  `);
+  // Community: admin-issued mutes (wallet blocked from sending chat_msg until muted_until)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS muted_wallets (
+      wallet       VARCHAR(255) PRIMARY KEY,
+      muted_until  BIGINT NOT NULL,
+      muted_by     VARCHAR(255),
+      reason       VARCHAR(280),
+      created_at   INT DEFAULT (UNIX_TIMESTAMP())
+    )
+  `);
 
   // Seed default config if not set
   const caRow = await dbGet("SELECT `key` FROM app_config WHERE `key`='contract_address'");
@@ -277,6 +300,23 @@ const CONFIG = {
   walletMaxTokens:       parseInt(process.env.WALLET_MAX_TOKENS)        || 90,
   minVolumeUsdFilter:    parseFloat(process.env.MIN_VOLUME_USD_FILTER)  || 50,
 };
+
+// ─── Community moderators ──────────────────────────────────────────────────
+// Comma-separated wallet addresses (case-insensitive) with delete-any-message
+// and mute powers in Community chat. Set via env — empty by default so no
+// wallet has admin power until explicitly configured.
+const ADMIN_WALLETS = new Set(
+  (process.env.ADMIN_WALLETS || '').split(',').map(w => w.trim().toLowerCase()).filter(Boolean)
+);
+const isAdminWallet = wallet => !!wallet && ADMIN_WALLETS.has(String(wallet).toLowerCase());
+
+// Returns the mute expiry (epoch ms) if `wallet` is currently muted, else null.
+async function _mutedUntil(wallet) {
+  if (!wallet) return null;
+  const row = await dbGet('SELECT muted_until FROM muted_wallets WHERE wallet=?', [String(wallet).toLowerCase()]);
+  if (!row || row.muted_until <= Date.now()) return null;
+  return row.muted_until;
+}
 
 const GOPLUS_CHAIN = { ethereum:'1', base:'8453', arbitrum:'42161', robinhood:'4663' };
 
@@ -2411,21 +2451,34 @@ const chatRooms = {
   alpha:    { name: 'Alpha',     icon: '🔥', messages: [] },
   freeshill:{ name: 'Free Shill',icon: '📣', messages: [] },
   holders:  { name: 'Holders',   icon: '💎', messages: [] },
+  private:  { name: 'Private',   icon: '🔐', messages: [] },
 };
 const MAX_CHAT_HISTORY = CONFIG.chatHistoryLimit;
 const chatUsers = new Map(); // ws -> { wallet, displayName, joinedAt }
 
+// Only Bloombot auto-replies to contract addresses posted in this room.
+const BOT_REPLY_ROOM = process.env.CHAT_BOT_ROOM || 'freeshill';
+
 // ─── Token-gated channels (parameterized via config / env) ────────────────────
-// A channel unlocks when the wallet holds at least `minAmount` of a token on
-// `chain`. If `token` (a CA) is set → checks that ERC-20 balance; otherwise →
-// checks the native coin (ETH) balance. The gate queries the chain's ACTIVE
-// network RPC (Sepolia in testnet mode locally). Override any field with env.
+// Two gate kinds:
+//  - 'balance' (default): unlocks when the wallet holds >= minAmount of a
+//    token (or native coin, if `token` is unset) on `chain`, re-checked live.
+//  - 'paid': unlocks permanently once a one-time payment of `amountEth` ETH
+//    to `treasury` on `chain` is verified on-chain (see /api/community/pay-verify).
 const CHANNEL_GATES = {
   holders: {
+    kind:      'balance',
     chain:     process.env.HOLDERS_GATE_CHAIN  || 'ethereum',
     token:     process.env.HOLDERS_GATE_TOKEN  || null,  // null → native ETH gate; set a CA → ERC-20 gate
     minAmount: parseFloat(process.env.HOLDERS_GATE_MIN || '0.01'),
     symbol:    process.env.HOLDERS_GATE_SYMBOL || '',    // blank → auto (native coin symbol)
+  },
+  private: {
+    kind:      'paid',
+    chain:     process.env.PRIVATE_GATE_CHAIN    || 'ethereum',
+    treasury:  process.env.PRIVATE_GATE_TREASURY || '0xf6a2b3016c7ac86724fa71cd4b3946facb319caa',
+    amountEth: parseFloat(process.env.PRIVATE_GATE_AMOUNT_ETH || '0.05'),
+    symbol:    'ETH',
   },
 };
 const _gateCache = new Map(); // `${room}:${wallet}` -> { val, ts }
@@ -2459,15 +2512,25 @@ async function _erc20BalanceOf(rpcUrl, token, wallet) {
 
 const _isAddr = a => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a);
 
-// Returns { gated, ok, minAmount, symbol, token, network, balance }
+// Returns { gated, ok, kind, ... } — shape varies slightly by gate kind (see below).
 async function checkChannelGate(room, wallet) {
   const gate = CHANNEL_GATES[room];
   if (!gate) return { gated: false, ok: true };
   const cfg     = chainCfg(gate.chain);
   const network = cfg.name || (gate.chain.charAt(0).toUpperCase() + gate.chain.slice(1));
+
+  // ── Paid gate: one-time on-chain payment, checked against our own DB ──────
+  if (gate.kind === 'paid') {
+    const base = { gated: true, kind: 'paid', amountEth: gate.amountEth, symbol: gate.symbol, treasury: gate.treasury, network };
+    if (!wallet || !_isAddr(wallet)) return { ...base, ok: false, reason: 'no_wallet' };
+    const paid = await dbGet('SELECT id FROM channel_payments WHERE room=? AND wallet=?', [room, wallet.toLowerCase()]);
+    return { ...base, ok: !!paid };
+  }
+
+  // ── Balance gate: live on-chain balance check (existing behavior) ────────
   const isToken = _isAddr(gate.token);
   const symbol  = gate.symbol || (isToken ? 'TOKEN' : 'ETH'); // native coin symbol default
-  const base = { gated: true, minAmount: gate.minAmount, symbol, token: isToken ? gate.token : null, network };
+  const base = { gated: true, kind: 'balance', minAmount: gate.minAmount, symbol, token: isToken ? gate.token : null, network };
 
   if (!wallet || !_isAddr(wallet)) {
     return { ...base, ok: false, balance: 0, reason: 'no_wallet' };
@@ -2486,6 +2549,41 @@ async function checkChannelGate(room, wallet) {
   _gateCache.set(key, { val, ts: Date.now() });
   return val;
 }
+
+// Verify a payment tx on-chain and, if valid, permanently unlock a paid room
+// for that wallet. tx_hash is UNIQUE in the DB so a tx can't be replayed to
+// credit multiple times (though it would just be a harmless no-op re-insert).
+app.post('/api/community/pay-verify', async (req, res) => {
+  const { wallet, room, txHash } = req.body || {};
+  const gate = CHANNEL_GATES[room];
+  if (!gate || gate.kind !== 'paid') return res.status(400).json({ error: 'not a paid channel' });
+  if (!_isAddr(wallet)) return res.status(400).json({ error: 'invalid wallet' });
+  if (typeof txHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) return res.status(400).json({ error: 'invalid tx hash' });
+
+  try {
+    const cfg = chainCfg(gate.chain);
+    const [txRes, receiptRes] = await Promise.all([
+      axios.post(cfg.rpc, { jsonrpc:'2.0', id:1, method:'eth_getTransactionByHash', params:[txHash] }, { timeout: 10000 }),
+      axios.post(cfg.rpc, { jsonrpc:'2.0', id:1, method:'eth_getTransactionReceipt', params:[txHash] }, { timeout: 10000 }),
+    ]);
+    const tx      = txRes.data?.result;
+    const receipt = receiptRes.data?.result;
+    if (!tx || !receipt) return res.status(400).json({ ok: false, error: 'Transaction not found (may still be pending — try again shortly)' });
+    if (receipt.status !== '0x1') return res.status(400).json({ ok: false, error: 'Transaction failed on-chain' });
+    if (String(tx.from).toLowerCase() !== wallet.toLowerCase()) return res.status(400).json({ ok: false, error: 'Transaction sender does not match wallet' });
+    if (String(tx.to).toLowerCase() !== gate.treasury.toLowerCase()) return res.status(400).json({ ok: false, error: 'Transaction was not sent to the treasury address' });
+    const valueEth = Number(BigInt(tx.value || '0x0')) / 1e18;
+    if (valueEth < gate.amountEth - 1e-9) return res.status(400).json({ ok: false, error: `Payment too low — sent ${valueEth} ETH, need ${gate.amountEth} ETH` });
+
+    await dbRun(
+      `INSERT IGNORE INTO channel_payments (wallet, room, tx_hash, amount_eth) VALUES (?,?,?,?)`,
+      [wallet.toLowerCase(), room, txHash.toLowerCase(), valueEth]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // Gate status for all gated rooms — used by the frontend to lock/unlock the UI
 app.get('/api/community/gate/:wallet', async (req, res) => {
@@ -2705,7 +2803,8 @@ wss.on('connection', (ws) => {
         const profile = wallet ? await dbGet('SELECT display_name, avatar FROM user_profiles WHERE wallet=?', [wallet]) : null;
         const displayName = profile?.display_name || msg.displayName || shortAddr(wallet) || 'Anon#' + Math.floor(Math.random() * 9999);
         const avatar = profile?.avatar || null;
-        chatUsers.set(ws, { wallet, displayName, avatar, joinedAt: Date.now() });
+        const isAdmin = isAdminWallet(wallet);
+        chatUsers.set(ws, { wallet, displayName, avatar, joinedAt: Date.now(), isAdmin });
         // Send history from DB (last 100 per room). Gated rooms only include
         // history when the user's wallet passes the gate.
         const history = {};
@@ -2725,7 +2824,8 @@ wss.on('connection', (ws) => {
             edited: !!r.edited,
           }));
         }
-        ws.send(JSON.stringify({ type: 'chat_history', history, gates, online: onlineCount() }));
+        const mutedUntil = wallet ? await _mutedUntil(wallet) : null;
+        ws.send(JSON.stringify({ type: 'chat_history', history, gates, online: onlineCount(), isAdmin, mutedUntil }));
         broadcastChat('*', { type: 'chat_online', online: onlineCount() });
         return;
       }
@@ -2736,6 +2836,14 @@ wss.on('connection', (ws) => {
         if (!user) return;
         const room = chatRooms[msg.room];
         if (!room) return;
+        // Muted wallets can't send until their mute expires
+        if (user.wallet) {
+          const mutedUntil = await _mutedUntil(user.wallet);
+          if (mutedUntil) {
+            ws.send(JSON.stringify({ type: 'chat_muted', mutedUntil }));
+            return;
+          }
+        }
         // Token-gated channel: verify the user's wallet passes the gate
         if (CHANNEL_GATES[msg.room]) {
           const g = await checkChannelGate(msg.room, user.wallet);
@@ -2747,7 +2855,7 @@ wss.on('connection', (ws) => {
         const text = String(msg.text || '').trim().slice(0, CONFIG.chatMsgMaxLen);
         const imgData = msg.imgData && typeof msg.imgData === 'string'
           && msg.imgData.startsWith('data:image/')
-          && msg.imgData.length < 800000
+          && msg.imgData.length < 400000  // ~300KB raw — server-side backstop; client already compresses harder
           ? msg.imgData : null;
         if (!text && !imgData) return;
         // Reply target: resolve from DB so the snippet can't be spoofed by the client.
@@ -2782,12 +2890,14 @@ wss.on('connection', (ws) => {
           [entry.room, entry.room, CONFIG.chatDbPruneLimit]);
         broadcastChat(msg.room, { type: 'chat_msg', msg: entry, online: onlineCount() });
 
-        // Bot: detect a contract address in the message and auto-analyze it —
-        // the bot's answer is threaded as a reply to this message.
-        const caMatch = text.match(/0x[a-fA-F0-9]{40}/);
-        if (caMatch) {
-          const botReply = { id: entry.id, name: entry.displayName, text: (text || '📷 image').slice(0, 120) };
-          _chatBotAnalyze(caMatch[0], msg.room, botReply).catch(() => {});
+        // Bot: detect a contract address and auto-analyze it — only in the
+        // designated room (Free Shill), threaded as a reply to this message.
+        if (msg.room === BOT_REPLY_ROOM) {
+          const caMatch = text.match(/0x[a-fA-F0-9]{40}/);
+          if (caMatch) {
+            const botReply = { id: entry.id, name: entry.displayName, text: (text || '📷 image').slice(0, 120) };
+            _chatBotAnalyze(caMatch[0], msg.room, botReply).catch(() => {});
+          }
         }
         return;
       }
@@ -2819,14 +2929,55 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // ── chat: delete own message ──
+      // ── chat: delete message (own, or any message if admin) ──
       if (msg.type === 'chat_delete') {
         const user = chatUsers.get(ws);
         if (!user || !user.wallet) return;
         const row = await dbGet('SELECT id, room, wallet FROM chat_messages WHERE id=?', [String(msg.id || '')]);
-        if (!row || row.wallet !== user.wallet) return;    // own messages only
+        if (!row) return;
+        const isOwn = row.wallet === user.wallet;
+        if (!isOwn && !user.isAdmin) return;                // own messages, or any message if admin
         await dbRun('DELETE FROM chat_messages WHERE id=?', [row.id]);
-        broadcastChat(row.room, { type: 'chat_deleted', id: row.id, room: row.room });
+        broadcastChat(row.room, { type: 'chat_deleted', id: row.id, room: row.room, byAdmin: !isOwn });
+        return;
+      }
+
+      // ── admin: mute a wallet for N minutes (blocks chat_msg until it expires) ──
+      if (msg.type === 'chat_mute') {
+        const user = chatUsers.get(ws);
+        if (!user || !user.isAdmin) return;
+        const targetWallet = String(msg.wallet || '').toLowerCase();
+        const minutes = Math.max(1, Math.min(43200, parseInt(msg.minutes) || 60)); // 1 min .. 30 days
+        if (!_isAddr(targetWallet)) return;
+        const mutedUntil = Date.now() + minutes * 60000;
+        await dbRun(
+          `INSERT INTO muted_wallets (wallet, muted_until, muted_by, reason) VALUES (?,?,?,?)
+           ON DUPLICATE KEY UPDATE muted_until=VALUES(muted_until), muted_by=VALUES(muted_by), reason=VALUES(reason)`,
+          [targetWallet, mutedUntil, user.wallet, String(msg.reason || '').slice(0, 280) || null]
+        );
+        ws.send(JSON.stringify({ type: 'chat_mute_ok', wallet: targetWallet, mutedUntil }));
+        // Notify the muted user's live connection(s), if online, so their UI updates immediately.
+        for (const [otherWs, otherUser] of chatUsers) {
+          if (otherUser.wallet && otherUser.wallet.toLowerCase() === targetWallet && otherWs.readyState === WebSocket.OPEN) {
+            otherWs.send(JSON.stringify({ type: 'chat_muted', mutedUntil }));
+          }
+        }
+        return;
+      }
+
+      // ── admin: lift a mute early ──
+      if (msg.type === 'chat_unmute') {
+        const user = chatUsers.get(ws);
+        if (!user || !user.isAdmin) return;
+        const targetWallet = String(msg.wallet || '').toLowerCase();
+        if (!_isAddr(targetWallet)) return;
+        await dbRun('DELETE FROM muted_wallets WHERE wallet=?', [targetWallet]);
+        ws.send(JSON.stringify({ type: 'chat_mute_ok', wallet: targetWallet, mutedUntil: null }));
+        for (const [otherWs, otherUser] of chatUsers) {
+          if (otherUser.wallet && otherUser.wallet.toLowerCase() === targetWallet && otherWs.readyState === WebSocket.OPEN) {
+            otherWs.send(JSON.stringify({ type: 'chat_muted', mutedUntil: null }));
+          }
+        }
         return;
       }
 
