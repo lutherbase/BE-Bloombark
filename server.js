@@ -331,7 +331,7 @@ const GECKO_NETWORK = {
   base:      'base',
   arbitrum:  'arbitrum',
   tron:      'tron',
-  robinhood: 'robinhood', // GeckoTerminal may not support yet — fallback to DexScreener
+  robinhood: 'robinhood',
 };
 
 // Map our chain key → DexScreener chainId
@@ -2814,12 +2814,12 @@ async function _chatBotAnalyze(ca, roomKey, reply = null) {
 // ─── BloomBuy poller: watches recent trades for the configured token, posts a
 // card to $BBRK Moon for every BUY (sells intentionally skipped). ─────────────
 const MOON_BOT_ROOM    = 'moon';
-const MOON_BOT_CHAIN   = process.env.MOON_BOT_CHAIN || 'ethereum';
+const MOON_BOT_CHAIN   = process.env.MOON_BOT_CHAIN || 'robinhood';
 // Token to monitor comes from app_config.contract_address — the SAME field the
 // landing page CA uses — so this automatically points at $BBRK once it's live.
 // Until then (value still 'coming_soon'), fall back to a well-known, actively
-// traded token so the channel is verifiable right now: PEPE/Ethereum.
-const MOON_BOT_TEST_TOKEN = process.env.MOON_BOT_TEST_TOKEN || '0x6982508145454Ce325dDbE47a25d4ec3d2311933';
+// traded token so the channel is verifiable right now: HOODER/Robinhood chain.
+const MOON_BOT_TEST_TOKEN = process.env.MOON_BOT_TEST_TOKEN || '0x30c9c51e06faa8cc71e4c101a69a9ed8d01ee91a';
 const MOON_BOT_POLL_MS    = (parseInt(process.env.MOON_BOT_POLL_SEC) || 45) * 1000;
 
 let _moonBotPool   = null;  // { poolAddress, geckoNetwork, chainId, tokenAddress, tokenSymbol, quoteSymbol }
