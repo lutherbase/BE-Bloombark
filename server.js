@@ -2359,6 +2359,47 @@ const _buildPayload = (dsPairs, chains) => {
 
 const _dsGet = url => axios.get(url, { timeout: 8000 }).catch(() => null);
 
+// Real "what's trending right now" data — one call per chain, additive to the
+// fixed DexScreener token/search lists above. Failures (incl. 429) are
+// swallowed here just like _dsGet so a Gecko hiccup never breaks the
+// dashboard; it only means fewer fresh entries that refresh cycle.
+async function _geckoTrendingPools(chainId) {
+  const network = GECKO_NETWORK[chainId];
+  if (!network) return [];
+  try {
+    const { data } = await axios.get(
+      `https://api.geckoterminal.com/api/v2/networks/${network}/trending_pools?limit=20&include=base_token`,
+      { timeout: 8000, headers: GECKO_HEADS }
+    );
+    const included = {};
+    for (const inc of data?.included || []) included[inc.id] = inc.attributes;
+    return (data?.data || []).map(p => {
+      const a = p.attributes || {};
+      const baseTokenId = p.relationships?.base_token?.data?.id;
+      const baseToken = included[baseTokenId];
+      if (!a.address) return null;
+      return {
+        name:           a.name || '?',
+        address:        baseToken?.address || '',
+        pairAddress:    a.address,
+        network:        _dashChainLabel(chainId),
+        networkId:      chainId,
+        price:          parseFloat(a.base_token_price_usd || 0),
+        priceChange24h: parseFloat(a.price_change_percentage?.h24 || 0),
+        volume24h:      parseFloat(a.volume_usd?.h24 || 0),
+        liquidity:      parseFloat(a.reserve_in_usd || 0),
+        fdv:            parseFloat(a.fdv_usd || a.market_cap_usd || 0),
+        createdAt:      a.pool_created_at || null,
+        buys24h:        parseInt(a.transactions?.h24?.buys  || 0),
+        sells24h:       parseInt(a.transactions?.h24?.sells || 0),
+      };
+    }).filter(Boolean);
+  } catch (e) {
+    console.error(`[dash] gecko trending failed [${chainId}]:`, e.message);
+    return [];
+  }
+}
+
 async function _fetchDash(key) {
   if (_dashFetching[key]) return;
   _dashFetching[key] = true;
@@ -2366,18 +2407,21 @@ async function _fetchDash(key) {
     let dsPairs = [];
 
     if (key === 'all') {
-      // All Chains: DexScreener generic queries + Robinhood-specific queries (tokens differ from other chains)
-      const [generalRes, robinhoodRes] = await Promise.all([
+      // All Chains: DexScreener generic queries + Robinhood-specific queries (tokens differ from other chains),
+      // plus one GeckoTerminal trending-pools call per chain so the list isn't just the same fixed tokens forever.
+      const [generalRes, robinhoodRes, trendingRes] = await Promise.all([
         Promise.all(DS_ALL_QUERIES.map(q => _dsGet(`${DEXSCREENER}/latest/dex/search?q=${q}`))),
         Promise.all(['robin','cashcat','tendies','wood','home'].map(q => _dsGet(`${DEXSCREENER}/latest/dex/search?q=${q}&chainIds=robinhood`))),
+        Promise.all(DASH_CHAINS.map(c => _geckoTrendingPools(c))),
       ]);
       dsPairs = [
         ...generalRes.flatMap(r => (r?.data?.pairs || []).map(_mapDS)),
         ...robinhoodRes.flatMap(r => (r?.data?.pairs || []).filter(p => p?.chainId === 'robinhood').map(_mapDS)),
+        ...trendingRes.flat(),
       ];
     } else {
-      // Per-chain: DS token addresses + DS searches filtered to chain
-      // (GeckoTerminal new_pools call removed — not worth the rate-limit cost)
+      // Per-chain: DS token addresses + DS searches filtered to chain, plus
+      // GeckoTerminal trending pools for real day-to-day variety.
       const addrs   = DS_CHAIN_TOKENS[key] || [];
       const chainSearches = {
         ethereum:  ['weth','pepe','shib','uni','link','aave','crv','mkr'],
@@ -2385,13 +2429,15 @@ async function _fetchDash(key) {
         robinhood: ['robin','cashcat','tendies','wood','home'],
       }[key] || [];
 
-      const [dsAddrRes, dsSearchRes] = await Promise.all([
+      const [dsAddrRes, dsSearchRes, trending] = await Promise.all([
         Promise.all(addrs.map(a => _dsGet(`${DEXSCREENER}/latest/dex/tokens/${a}`))),
         Promise.all(chainSearches.map(q => _dsGet(`${DEXSCREENER}/latest/dex/search?q=${q}&chainIds=${key}`))),
+        _geckoTrendingPools(key),
       ]);
       dsPairs  = [
         ...dsAddrRes.flatMap(r => (r?.data?.pairs || []).filter(p => p?.chainId === key).map(_mapDS)),
         ...dsSearchRes.flatMap(r => (r?.data?.pairs || []).filter(p => p?.chainId === key).map(_mapDS)),
+        ...trending,
       ].filter(p => p && p.networkId === key);
     }
 
