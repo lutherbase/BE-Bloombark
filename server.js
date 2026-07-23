@@ -2632,9 +2632,11 @@ const _isAddr = a => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a);
 // contract_address the landing page / BloomBuy use, then looks up its price
 // on DexScreener. Cached 5 minutes — this is a balance-check hot path, not
 // worth hitting DexScreener on every single gate check.
+const HOLDERS_GATE_EVM_CHAINS = new Set(['ethereum', 'base', 'arbitrum', 'robinhood']);
+
 let _holdersGateBasis   = null;
 let _holdersGateBasisAt = 0;
-async function _resolveHoldersGateUsdBasis(chain) {
+async function _resolveHoldersGateUsdBasis() {
   if (_holdersGateBasis && Date.now() - _holdersGateBasisAt < 5 * 60 * 1000) return _holdersGateBasis;
   try {
     const [caRow, tickerRow] = await Promise.all([
@@ -2644,13 +2646,17 @@ async function _resolveHoldersGateUsdBasis(chain) {
     const addr = caRow?.value || '';
     if (!_isAddr(addr)) { _holdersGateBasis = null; _holdersGateBasisAt = Date.now(); return null; }
     const { data } = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${addr}`, { timeout: 8000 });
+    // Don't assume a fixed chain — pick the highest-liquidity pool across
+    // whichever supported EVM chain the token actually trades on (same
+    // pattern BloomBuy uses), so this works regardless of where $BBRK launches.
     const pairs = (data?.pairs || [])
-      .filter(p => p.chainId === chain)
+      .filter(p => HOLDERS_GATE_EVM_CHAINS.has(p.chainId))
       .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
     if (!pairs.length) { _holdersGateBasis = null; _holdersGateBasisAt = Date.now(); return null; }
     const p = pairs[0];
     _holdersGateBasis = {
       token:  p.baseToken?.address || addr,
+      chain:  p.chainId,
       // Use the app's own ticker (same one the landing page shows) rather
       // than the on-chain symbol, so the gate always reads "$BBRK"-style.
       symbol: '$' + (tickerRow?.value || p.baseToken?.symbol || 'TOKEN'),
@@ -2683,18 +2689,21 @@ async function checkChannelGate(room, wallet) {
   //    quantity always represents a fixed USD amount rather than a fixed
   //    token count that drifts out of sync with price. ─────────────────────
   if (gate.kind === 'balance' && gate.usdMode) {
-    const basis = await _resolveHoldersGateUsdBasis(gate.chain);
+    const basis = await _resolveHoldersGateUsdBasis();
     if (!basis || !(basis.price > 0)) {
       return { gated: true, kind: 'balance', minAmount: null, minUsd: gate.minUsd, symbol: basis?.symbol || 'TOKEN', token: null, network, ok: false, balance: 0, reason: 'token_not_live' };
     }
+    // Chain is whatever the resolved token actually trades on, not a fixed config.
+    const basisCfg     = chainCfg(basis.chain);
+    const basisNetwork = basisCfg.name || (basis.chain.charAt(0).toUpperCase() + basis.chain.slice(1));
     const minAmount = gate.minUsd / basis.price;
-    const base = { gated: true, kind: 'balance', minAmount, minUsd: gate.minUsd, symbol: basis.symbol, token: basis.token, network };
+    const base = { gated: true, kind: 'balance', minAmount, minUsd: gate.minUsd, symbol: basis.symbol, token: basis.token, network: basisNetwork };
     if (!wallet || !_isAddr(wallet)) return { ...base, ok: false, balance: 0, reason: 'no_wallet' };
     const key = `${room}:${wallet.toLowerCase()}`;
     const cached = _gateCache.get(key);
     if (cached && Date.now() - cached.ts < CONFIG.gateCacheTtlMs) return cached.val;
     let balance = 0;
-    try { balance = await _erc20BalanceOf(cfg.rpc, basis.token, wallet); } catch (_) {}
+    try { balance = await _erc20BalanceOf(basisCfg.rpc, basis.token, wallet); } catch (_) {}
     const val = { ...base, ok: balance >= minAmount, balance };
     _gateCache.set(key, { val, ts: Date.now() });
     return val;
