@@ -2843,7 +2843,10 @@ async function _resolveMoonBotPool() {
     const pairs = (data?.pairs || [])
       .filter(p => p.chainId === MOON_BOT_CHAIN)
       .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-    if (!pairs.length) return null;
+    if (!pairs.length) {
+      _moonBotLastError = { message: `no ${MOON_BOT_CHAIN} pairs found for ${address} on DexScreener`, at: new Date().toISOString() };
+      return null;
+    }
     const p = pairs[0];
     const pool = {
       poolAddress:  p.pairAddress,
@@ -2863,6 +2866,7 @@ async function _resolveMoonBotPool() {
     _moonBotPoolAt = Date.now();
     return pool;
   } catch (e) {
+    _moonBotLastError = { message: `pool resolve: ${e.message}`, at: new Date().toISOString() };
     console.error('[moonbot] pool resolve failed:', e.message);
     return null;
   }
