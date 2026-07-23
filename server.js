@@ -2679,7 +2679,7 @@ async function checkChannelGate(room, wallet) {
 
   // ── Paid gate: one-time on-chain payment, checked against our own DB ──────
   if (gate.kind === 'paid') {
-    const base = { gated: true, kind: 'paid', amountEth: gate.amountEth, symbol: gate.symbol, treasury: gate.treasury, network };
+    const base = { gated: true, kind: 'paid', amountEth: gate.amountEth, symbol: gate.symbol, treasury: gate.treasury, network, chainKey: gate.chain };
     if (!wallet || !_isAddr(wallet)) return { ...base, ok: false, reason: 'no_wallet' };
     const paid = await dbGet('SELECT id FROM channel_payments WHERE room=? AND wallet=?', [room, wallet.toLowerCase()]);
     return { ...base, ok: !!paid };
