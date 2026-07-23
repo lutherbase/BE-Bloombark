@@ -2368,18 +2368,22 @@ async function _geckoTrendingPools(chainId) {
   if (!network) return [];
   try {
     const { data } = await axios.get(
-      `https://api.geckoterminal.com/api/v2/networks/${network}/trending_pools?limit=20&include=base_token`,
+      `https://api.geckoterminal.com/api/v2/networks/${network}/trending_pools?limit=20&include=base_token,quote_token`,
       { timeout: 8000, headers: GECKO_HEADS }
     );
     const included = {};
     for (const inc of data?.included || []) included[inc.id] = inc.attributes;
     return (data?.data || []).map(p => {
       const a = p.attributes || {};
-      const baseTokenId = p.relationships?.base_token?.data?.id;
-      const baseToken = included[baseTokenId];
+      const baseTokenId  = p.relationships?.base_token?.data?.id;
+      const quoteTokenId = p.relationships?.quote_token?.data?.id;
+      const baseToken  = included[baseTokenId];
+      const quoteToken = included[quoteTokenId];
       if (!a.address) return null;
       return {
-        name:           a.name || '?',
+        // Build from token symbols rather than a.name (e.g. "WETH / USDC 0.05%")
+        // so the fee-tier suffix doesn't leak into the displayed pair name.
+        name:           `${baseToken?.symbol || '?'} / ${quoteToken?.symbol || '?'}`,
         address:        baseToken?.address || '',
         pairAddress:    a.address,
         network:        _dashChainLabel(chainId),
