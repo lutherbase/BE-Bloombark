@@ -2927,7 +2927,7 @@ async function _pollMoonBotTrades() {
         `Buy: ${_moonFmtAmt(ethAmount)} ${pool.quoteSymbol} (${_botFmtUsd(usdValue)})\n` +
         `Price ETH: ${_botFmtPrice(priceEth).replace('$', '')} ${pool.quoteSymbol}\n` +
         `Price USD: ${_botFmtPrice(priceUsd)}\n` +
-        `Dapat: ${_moonFmtAmt(tokenAmount)} ${pool.tokenSymbol}\n` +
+        `Received: ${_moonFmtAmt(tokenAmount)} ${pool.tokenSymbol}\n` +
         `Wallet: ${wallet}`;
       await _botSend(MOON_BOT_ROOM, text, null, null, { name: BUY_BOT_NAME, avatar: BUY_BOT_AVATAR });
     }
