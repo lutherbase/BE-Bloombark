@@ -2582,9 +2582,12 @@ const CHANNEL_GATES = {
   holders: {
     kind:      'balance',
     chain:     process.env.HOLDERS_GATE_CHAIN  || 'ethereum',
-    token:     process.env.HOLDERS_GATE_TOKEN  || null,  // null → native ETH gate; set a CA → ERC-20 gate
-    minAmount: parseFloat(process.env.HOLDERS_GATE_MIN || '0.01'),
-    symbol:    process.env.HOLDERS_GATE_SYMBOL || '',    // blank → auto (native coin symbol)
+    // USD-value mode: token is resolved live from app_config.contract_address
+    // (the same $BBRK CA the landing page and BloomBuy use) and minAmount is
+    // recomputed from minUsd / live price on every check, so the required
+    // token quantity tracks price instead of being a fixed amount.
+    usdMode:   true,
+    minUsd:    parseFloat(process.env.HOLDERS_GATE_MIN_USD || '90'),
   },
   private: {
     kind:      'paid',
@@ -2625,6 +2628,37 @@ async function _erc20BalanceOf(rpcUrl, token, wallet) {
 
 const _isAddr = a => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a);
 
+// Resolves the live token+price basis for a USD-value gate: reads the same
+// contract_address the landing page / BloomBuy use, then looks up its price
+// on DexScreener. Cached 5 minutes — this is a balance-check hot path, not
+// worth hitting DexScreener on every single gate check.
+let _holdersGateBasis   = null;
+let _holdersGateBasisAt = 0;
+async function _resolveHoldersGateUsdBasis(chain) {
+  if (_holdersGateBasis && Date.now() - _holdersGateBasisAt < 5 * 60 * 1000) return _holdersGateBasis;
+  try {
+    const caRow = await dbGet("SELECT value FROM app_config WHERE `key`='contract_address'");
+    const addr  = caRow?.value || '';
+    if (!_isAddr(addr)) { _holdersGateBasis = null; _holdersGateBasisAt = Date.now(); return null; }
+    const { data } = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${addr}`, { timeout: 8000 });
+    const pairs = (data?.pairs || [])
+      .filter(p => p.chainId === chain)
+      .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+    if (!pairs.length) { _holdersGateBasis = null; _holdersGateBasisAt = Date.now(); return null; }
+    const p = pairs[0];
+    _holdersGateBasis = {
+      token:  p.baseToken?.address || addr,
+      symbol: p.baseToken?.symbol  || 'TOKEN',
+      price:  parseFloat(p.priceUsd || 0),
+    };
+    _holdersGateBasisAt = Date.now();
+    return _holdersGateBasis;
+  } catch (e) {
+    console.error('[holders-gate] price resolve failed:', e.message);
+    return _holdersGateBasis; // serve last known-good rather than locking everyone out on a hiccup
+  }
+}
+
 // Returns { gated, ok, kind, ... } — shape varies slightly by gate kind (see below).
 async function checkChannelGate(room, wallet) {
   const gate = CHANNEL_GATES[room];
@@ -2640,7 +2674,28 @@ async function checkChannelGate(room, wallet) {
     return { ...base, ok: !!paid };
   }
 
-  // ── Balance gate: live on-chain balance check (existing behavior) ────────
+  // ── USD-value balance gate: token + price resolved live, so the required
+  //    quantity always represents a fixed USD amount rather than a fixed
+  //    token count that drifts out of sync with price. ─────────────────────
+  if (gate.kind === 'balance' && gate.usdMode) {
+    const basis = await _resolveHoldersGateUsdBasis(gate.chain);
+    if (!basis || !(basis.price > 0)) {
+      return { gated: true, kind: 'balance', minAmount: null, minUsd: gate.minUsd, symbol: basis?.symbol || 'TOKEN', token: null, network, ok: false, balance: 0, reason: 'token_not_live' };
+    }
+    const minAmount = gate.minUsd / basis.price;
+    const base = { gated: true, kind: 'balance', minAmount, minUsd: gate.minUsd, symbol: basis.symbol, token: basis.token, network };
+    if (!wallet || !_isAddr(wallet)) return { ...base, ok: false, balance: 0, reason: 'no_wallet' };
+    const key = `${room}:${wallet.toLowerCase()}`;
+    const cached = _gateCache.get(key);
+    if (cached && Date.now() - cached.ts < CONFIG.gateCacheTtlMs) return cached.val;
+    let balance = 0;
+    try { balance = await _erc20BalanceOf(cfg.rpc, basis.token, wallet); } catch (_) {}
+    const val = { ...base, ok: balance >= minAmount, balance };
+    _gateCache.set(key, { val, ts: Date.now() });
+    return val;
+  }
+
+  // ── Balance gate: live on-chain balance check (existing fixed-amount behavior) ──
   const isToken = _isAddr(gate.token);
   const symbol  = gate.symbol || (isToken ? 'TOKEN' : 'ETH'); // native coin symbol default
   const base = { gated: true, kind: 'balance', minAmount: gate.minAmount, symbol, token: isToken ? gate.token : null, network };
