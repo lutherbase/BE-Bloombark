@@ -2472,6 +2472,8 @@ const chatRooms = {
   freeshill:{ name: 'Free Shill',icon: '📣', messages: [] },
   holders:  { name: 'Holders',   icon: '💎', messages: [] },
   private:  { name: 'Private',   icon: '🔐', messages: [] },
+  // Read-only BloomBuy feed — no user can post here, enforced below in chat_msg.
+  moon:     { name: '$BBRK Moon',icon: '🌕', messages: [], readOnly: true },
 };
 const MAX_CHAT_HISTORY = CONFIG.chatHistoryLimit;
 const chatUsers = new Map(); // ws -> { wallet, displayName, joinedAt }
@@ -2646,6 +2648,16 @@ const BOT_AVATAR = 'data:image/svg+xml;base64,' + Buffer.from(
 const BOT_CHAINS = new Set(['ethereum', 'base', 'arbitrum', 'polygon', 'optimism', 'robinhood']);
 const _botCooldown = new Map(); // ca -> last reply ts (avoid spamming same CA)
 
+// ─── BloomBuy: posts a card to $BBRK Moon for every on-chain BUY (sells skipped) ──
+const BUY_BOT_NAME = 'BloomBuy';
+const BUY_BOT_AVATAR = 'data:image/svg+xml;base64,' + Buffer.from(
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="64" height="64">
+    <rect width="24" height="24" rx="6" fill="#0d2818"/>
+    <path d="M5 16l4-6 3 4 5-8" stroke="#27C97F" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M13 6h5v5" stroke="#27C97F" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`
+).toString('base64');
+
 const _svgEsc = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 
 function _botFmtUsd(v) {
@@ -2723,13 +2735,13 @@ function _botSvgCard(info) {
   return 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64');
 }
 
-async function _botSend(roomKey, text, imgData = null, reply = null) {
+async function _botSend(roomKey, text, imgData = null, reply = null, identity = null) {
   const entry = {
     id:   Date.now() + Math.random().toString(36).slice(2,6),
     room: roomKey,
     wallet: null,
-    displayName: BOT_NAME,
-    avatar: BOT_AVATAR,
+    displayName: identity?.name   || BOT_NAME,
+    avatar:      identity?.avatar || BOT_AVATAR,
     text,
     imgData,
     ts: Date.now(),
@@ -2803,6 +2815,156 @@ async function _chatBotAnalyze(ca, roomKey, reply = null) {
   }
 }
 
+// ─── BloomBuy poller: watches recent trades for the configured token, posts a
+// card to $BBRK Moon for every BUY (sells intentionally skipped). ─────────────
+const MOON_BOT_ROOM    = 'moon';
+const MOON_BOT_CHAIN   = process.env.MOON_BOT_CHAIN || 'ethereum';
+// Token to monitor comes from app_config.contract_address — the SAME field the
+// landing page CA uses — so this automatically points at $BBRK once it's live.
+// Until then (value still 'coming_soon'), fall back to a well-known, actively
+// traded token so the channel is verifiable right now: PEPE/Ethereum.
+const MOON_BOT_TEST_TOKEN = process.env.MOON_BOT_TEST_TOKEN || '0x6982508145454Ce325dDbE47a25d4ec3d2311933';
+const MOON_BOT_POLL_MS    = (parseInt(process.env.MOON_BOT_POLL_SEC) || 25) * 1000;
+
+let _moonBotPool   = null;  // { poolAddress, geckoNetwork, chainId, tokenAddress, tokenSymbol, quoteSymbol }
+let _moonBotPoolAt = 0;
+let _moonBotLastTs = 0;     // only trades newer than this get considered
+let _moonBotSeenTx = new Set();
+
+async function _resolveMoonBotToken() {
+  const caRow = await dbGet("SELECT value FROM app_config WHERE `key`='contract_address'");
+  const isLive = /^0x[0-9a-fA-F]{40}$/.test(caRow?.value || '');
+  return { address: isLive ? caRow.value : MOON_BOT_TEST_TOKEN, isLive };
+}
+
+async function _resolveMoonBotPool() {
+  if (_moonBotPool && Date.now() - _moonBotPoolAt < 5 * 60 * 1000) return _moonBotPool;
+  try {
+    const { address } = await _resolveMoonBotToken();
+    const { data } = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${address}`, { timeout: 8000 });
+    const pairs = (data?.pairs || [])
+      .filter(p => p.chainId === MOON_BOT_CHAIN)
+      .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+    if (!pairs.length) return null;
+    const p = pairs[0];
+    const pool = {
+      poolAddress:  p.pairAddress,
+      geckoNetwork: GECKO_NETWORK[MOON_BOT_CHAIN] || 'eth',
+      chainId:      MOON_BOT_CHAIN,
+      tokenAddress: p.baseToken?.address || address,
+      tokenSymbol:  p.baseToken?.symbol  || '?',
+      quoteSymbol:  p.quoteToken?.symbol || 'ETH',
+    };
+    // Pool changed (token swapped, e.g. test token → real $BBRK at launch) —
+    // reset dedupe state so we don't compare timestamps across two pools.
+    if (!_moonBotPool || _moonBotPool.poolAddress !== pool.poolAddress) {
+      _moonBotLastTs = 0;
+      _moonBotSeenTx = new Set();
+    }
+    _moonBotPool = pool;
+    _moonBotPoolAt = Date.now();
+    return pool;
+  } catch (e) {
+    console.error('[moonbot] pool resolve failed:', e.message);
+    return null;
+  }
+}
+
+const _moonFmtAmt = n => {
+  n = parseFloat(n) || 0;
+  if (n >= 1000) return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  return n.toLocaleString('en-US', { maximumFractionDigits: n < 1 ? 6 : 4 });
+};
+
+// Bloombark-styled BUY card (green theme, matches _botSvgCard's visual language)
+function _moonBuySvgCard(t) {
+  const svg = `<svg width="520" height="200" viewBox="0 0 520 200" xmlns="http://www.w3.org/2000/svg">
+  <rect width="520" height="200" rx="16" fill="#0d1a12"/>
+  <rect x="0.5" y="0.5" width="519" height="199" rx="16" fill="none" stroke="#27c97f55"/>
+  <rect x="0" y="0" width="520" height="48" rx="16" fill="#0f2419"/>
+  <rect x="0" y="34" width="520" height="14" fill="#0f2419"/>
+  <path d="M22 30 L28 18 L34 30" stroke="#27c97f" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="46" y="30" font-family="Menlo, monospace" font-size="13" font-weight="bold" fill="#e2e8f0" letter-spacing="2">BLOOMBUY</text>
+  <rect x="${520-108}" y="13" width="88" height="22" rx="11" fill="#27c97f22" stroke="#27c97f"/>
+  <text x="${520-64}" y="28" font-family="Menlo, monospace" font-size="10" font-weight="bold" fill="#27c97f" text-anchor="middle">BUY</text>
+
+  <text x="26" y="80" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1.5">TOKEN</text>
+  <text x="26" y="104" font-family="Menlo, monospace" font-size="22" font-weight="bold" fill="#e2e8f0">${_svgEsc(t.symbol)}</text>
+
+  <g transform="translate(200,66)">
+    <text x="0" y="0" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1">SPENT</text>
+    <text x="0" y="20" font-family="Menlo, monospace" font-size="15" font-weight="bold" fill="#e2e8f0">${_svgEsc(t.ethAmountStr)}</text>
+  </g>
+  <g transform="translate(340,66)">
+    <text x="0" y="0" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1">USD VALUE</text>
+    <text x="0" y="20" font-family="Menlo, monospace" font-size="15" font-weight="bold" fill="#27c97f">${_svgEsc(t.usdStr)}</text>
+  </g>
+  <g transform="translate(200,110)">
+    <text x="0" y="0" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1">RECEIVED</text>
+    <text x="0" y="20" font-family="Menlo, monospace" font-size="15" font-weight="bold" fill="#e2e8f0">${_svgEsc(t.tokenAmountStr)} ${_svgEsc(t.symbol)}</text>
+  </g>
+
+  <line x1="26" y1="142" x2="494" y2="142" stroke="#1e2235"/>
+  <text x="26" y="166" font-family="Menlo, monospace" font-size="9" fill="#4b5563">Buyer: ${_svgEsc(t.wallet)}</text>
+  <text x="494" y="166" font-family="Menlo, monospace" font-size="9" fill="#4b5563" text-anchor="end">bloombark terminal · not financial advice</text>
+</svg>`;
+  return 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64');
+}
+
+let _moonBotPolling = false;
+async function _pollMoonBotTrades() {
+  if (_moonBotPolling) return; // avoid overlapping polls if one runs long
+  _moonBotPolling = true;
+  try {
+    const pool = await _resolveMoonBotPool();
+    if (!pool) return;
+    const url = `https://api.geckoterminal.com/api/v2/networks/${pool.geckoNetwork}/pools/${pool.poolAddress}/trades?limit=20`;
+    const { data } = await axios.get(url, { timeout: 10000, headers: GECKO_HEADS });
+    const raw = (data?.data || []).slice().reverse(); // oldest → newest, post in order
+    const isFirstRun = _moonBotLastTs === 0 && _moonBotSeenTx.size === 0;
+    let maxTs = _moonBotLastTs;
+
+    for (const t of raw) {
+      const a = t.attributes || {};
+      const tsMs   = a.block_timestamp ? new Date(a.block_timestamp).getTime() : 0;
+      const txHash = a.tx_hash || '';
+      if (!tsMs || tsMs <= _moonBotLastTs || (txHash && _moonBotSeenTx.has(txHash))) continue;
+      if (txHash) {
+        _moonBotSeenTx.add(txHash);
+        if (_moonBotSeenTx.size > 500) _moonBotSeenTx = new Set([..._moonBotSeenTx].slice(-250));
+      }
+      if (tsMs > maxTs) maxTs = tsMs;
+
+      // First poll after boot just establishes the baseline — don't spam-post
+      // the last 20 historical trades on every restart.
+      if (isFirstRun) continue;
+      if (a.kind !== 'buy') continue; // sells intentionally not posted
+
+      const ethAmount   = parseFloat(a.from_token_amount || 0); // quote (ETH) spent
+      const tokenAmount = parseFloat(a.to_token_amount   || 0); // base token received
+      const usdValue    = parseFloat(a.volume_in_usd || 0);
+      const wallet = a.tx_from_address ? shortAddr(a.tx_from_address) : '—';
+
+      const card = _moonBuySvgCard({
+        symbol: pool.tokenSymbol,
+        ethAmountStr:   `${_moonFmtAmt(ethAmount)} ${pool.quoteSymbol}`,
+        usdStr:         _botFmtUsd(usdValue),
+        tokenAmountStr: _moonFmtAmt(tokenAmount),
+        wallet,
+      });
+      const text = `🟢 BUY — ${_moonFmtAmt(ethAmount)} ${pool.quoteSymbol} (${_botFmtUsd(usdValue)}) → ${_moonFmtAmt(tokenAmount)} ${pool.tokenSymbol}`;
+      await _botSend(MOON_BOT_ROOM, text, card, null, { name: BUY_BOT_NAME, avatar: BUY_BOT_AVATAR });
+    }
+    if (maxTs > _moonBotLastTs) _moonBotLastTs = maxTs;
+  } catch (e) {
+    console.error('[moonbot] poll failed:', e.message);
+  } finally {
+    _moonBotPolling = false;
+  }
+}
+setTimeout(_pollMoonBotTrades, 8000);
+setInterval(_pollMoonBotTrades, MOON_BOT_POLL_MS);
+
 wss.on('connection', (ws) => {
   ws.on('message', async (raw) => {
     try {
@@ -2839,7 +3001,7 @@ wss.on('connection', (ws) => {
           history[k] = rows.reverse().map(r => ({
             id: r.id, room: r.room, wallet: r.wallet, displayName: r.display_name,
             avatar: r.avatar, text: r.text, imgData: r.img_data, ts: r.ts,
-            isBot: r.display_name === BOT_NAME && r.wallet == null,
+            isBot: (r.display_name === BOT_NAME || r.display_name === BUY_BOT_NAME) && r.wallet == null,
             replyTo: r.reply_to, replyName: r.reply_name, replyText: r.reply_text,
             edited: !!r.edited,
           }));
@@ -2856,6 +3018,7 @@ wss.on('connection', (ws) => {
         if (!user) return;
         const room = chatRooms[msg.room];
         if (!room) return;
+        if (room.readOnly) return; // e.g. $BBRK Moon — a bot-only feed, no user posts
         // Muted wallets can't send until their mute expires
         if (user.wallet) {
           const mutedUntil = await _mutedUntil(user.wallet);
