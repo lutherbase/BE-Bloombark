@@ -2826,6 +2826,7 @@ let _moonBotPool   = null;  // { poolAddress, geckoNetwork, chainId, tokenAddres
 let _moonBotPoolAt = 0;
 let _moonBotLastTs = 0;     // only trades newer than this get considered
 let _moonBotSeenTx = new Set();
+let _moonBotLastError = null;
 
 async function _resolveMoonBotToken() {
   const caRow = await dbGet("SELECT value FROM app_config WHERE `key`='contract_address'");
@@ -2952,7 +2953,9 @@ async function _pollMoonBotTrades() {
       await _botSend(MOON_BOT_ROOM, text, card, null, { name: BUY_BOT_NAME, avatar: BUY_BOT_AVATAR });
     }
     if (maxTs > _moonBotLastTs) _moonBotLastTs = maxTs;
+    _moonBotLastError = null;
   } catch (e) {
+    _moonBotLastError = { message: e.message, at: new Date().toISOString() };
     console.error('[moonbot] poll failed:', e.message);
   } finally {
     _moonBotPolling = false;
@@ -2973,6 +2976,7 @@ app.get('/api/admin/moonbot-status', (req, res) => {
     lastTradeTs: _moonBotLastTs ? new Date(_moonBotLastTs).toISOString() : null,
     seenTxCount: _moonBotSeenTx.size,
     currentlyPolling: _moonBotPolling,
+    lastError: _moonBotLastError,
     serverNow: new Date().toISOString(),
   });
 });
