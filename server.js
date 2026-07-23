@@ -2137,6 +2137,33 @@ let _narrativeCacheAt = 0;
 let _narrativeFetching = false;
 const NARRATIVE_TTL = (parseInt(process.env.NARRATIVE_TTL_MIN) || 60) * 60 * 1000; // default 1 hour
 
+// Persist to app_config so a cold boot (Render free-tier spin-down/restart)
+// can serve last-known data immediately instead of showing "Data loading"
+// to every visitor until a fresh CoinGecko fetch completes.
+async function _loadNarrativeCacheFromDb() {
+  try {
+    const row = await dbGet("SELECT value FROM app_config WHERE `key`='narrative_cache'");
+    if (!row) return;
+    const parsed = JSON.parse(row.value);
+    if (Array.isArray(parsed?.data)) {
+      _narrativeCache = parsed.data;
+      _narrativeCacheAt = parsed.at || 0;
+      console.log(`[narrative] restored ${_narrativeCache.length} categories from DB (age ${Math.round((Date.now()-_narrativeCacheAt)/60000)}min)`);
+    }
+  } catch (e) { console.error('[narrative] failed to restore from DB:', e.message); }
+}
+
+async function _saveNarrativeCacheToDb() {
+  if (!_narrativeCache) return;
+  try {
+    const value = JSON.stringify({ data: _narrativeCache, at: _narrativeCacheAt });
+    await dbRun(
+      "INSERT INTO app_config (`key`, value, updated_at) VALUES ('narrative_cache',?,UNIX_TIMESTAMP()) ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)",
+      [value]
+    );
+  } catch (e) { console.error('[narrative] failed to persist to DB:', e.message); }
+}
+
 async function _fetchNarrativeCounts(byId) {
   const countById = {};
   for (let i = 0; i < NARRATIVE_CATEGORIES.length; i++) {
@@ -2176,6 +2203,7 @@ async function _warmNarrative() {
     _narrativeCacheAt = Date.now();
     const missing = _narrativeCache.filter(n => n.coinCount === 0).length;
     console.log(`[narrative] cache warmed — ${_narrativeCache.length - missing} counts ok, ${missing} missing`);
+    await _saveNarrativeCacheToDb();
 
     // Retry missing counts after 10 minutes
     if (missing > 0) {
@@ -2192,6 +2220,7 @@ async function _warmNarrative() {
             await new Promise(r => setTimeout(r, CONFIG.narrativeFetchDelayMs));
           }
           console.log('[narrative] retry counts done');
+          await _saveNarrativeCacheToDb();
         } catch {}
       }, CONFIG.narrativeRetryDelayMs);
     }
@@ -2204,9 +2233,13 @@ app.get('/api/narrative', async (req, res) => {
     if (_narrativeCache && Date.now() - _narrativeCacheAt < NARRATIVE_TTL) {
       return res.json({ success: true, data: _narrativeCache });
     }
-    // Start background warm, return partial immediately if available
+    // Cache is stale or absent — kick a background refresh either way.
     _warmNarrative();
-    // Wait up to NARRATIVE_WAIT_TIMEOUT_SEC for at least partial data
+    // Stale data (e.g. restored from DB after a restart) is still useful —
+    // serve it immediately rather than making every visitor wait/error out
+    // while the background refresh runs.
+    if (_narrativeCache) return res.json({ success: true, data: _narrativeCache, stale: true });
+    // Truly no data yet (first-ever boot) — wait briefly for the warm to land.
     const _waitSteps = Math.ceil(CONFIG.narrativeWaitTimeoutMs / 1000);
     for (let i = 0; i < _waitSteps; i++) {
       await new Promise(r => setTimeout(r, 1000));
@@ -2220,7 +2253,9 @@ app.get('/api/narrative', async (req, res) => {
   }
 });
 
-// Pre-warm narrative on server start (background)
+// Pre-warm narrative on server start (background) — the DB-restored cache
+// (loaded in initDb().then(), below) already covers most cold starts, so
+// this just refreshes it if stale.
 setTimeout(() => _warmNarrative(), CONFIG.narrativeWarmDelayMs);
 
 app.get('/api/trending', async (req, res) => {
@@ -4354,7 +4389,8 @@ app.get('/api/trade/quote/evm', async (req, res) => {
 
 // Ensure the MySQL schema exists before accepting traffic
 initDb()
-  .then(() => {
+  .then(async () => {
+    await _loadNarrativeCacheFromDb();
     server.listen(PORT, () => console.log(`Bloombark Terminal Backend running on port ${PORT}`));
   })
   .catch((e) => {
