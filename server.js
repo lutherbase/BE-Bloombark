@@ -2316,8 +2316,11 @@ const _mapDS = p => {
   };
 };
 
+// Compare addresses case-insensitively — DexScreener returns checksummed
+// (mixed-case) addresses while GeckoTerminal returns lowercase, so the same
+// pool from both sources needs normalizing or it slips past a strict === dedupe.
 const _dedupe = arr => arr.filter((p, i, a) =>
-  p && a.findIndex(x => x && x.pairAddress === p.pairAddress && x.networkId === p.networkId) === i
+  p && a.findIndex(x => x && x.pairAddress?.toLowerCase() === p.pairAddress?.toLowerCase() && x.networkId === p.networkId) === i
 );
 
 const _buildPayload = (dsPairs, chains) => {
@@ -2330,13 +2333,13 @@ const _buildPayload = (dsPairs, chains) => {
   const earliestByToken = {};
   for (const p of pools) {
     if (!p.createdAt) continue;
-    const k = `${p.address}_${p.networkId}`;
+    const k = `${p.address?.toLowerCase()}_${p.networkId}`;
     const t = new Date(p.createdAt).getTime();
     if (!earliestByToken[k] || t < earliestByToken[k]) earliestByToken[k] = t;
   }
   for (const p of pools) {
     if (p.createdAt) continue;
-    const k = `${p.address}_${p.networkId}`;
+    const k = `${p.address?.toLowerCase()}_${p.networkId}`;
     if (earliestByToken[k]) p.createdAt = new Date(earliestByToken[k]).toISOString();
   }
 
