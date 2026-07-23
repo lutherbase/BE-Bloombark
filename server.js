@@ -4146,6 +4146,30 @@ async function _adminSetConfig(req, res) {
 app.get('/api/admin/config', _adminSetConfig);
 app.post('/api/admin/config', express.json(), _adminSetConfig);
 
+// Wipe all messages in a chat room. Requires an explicit room key ('all'
+// clears every room) — no default, so a bare call can't nuke everything
+// by accident. Same admin token as the other /api/admin/* endpoints.
+async function _adminClearChat(req, res) {
+  if (!ADMIN_QUERY_TOKEN) return res.status(404).json({ error: 'not enabled' });
+  const token = req.get('x-admin-token') || req.query.token || (req.body && req.body.token) || '';
+  if (token !== ADMIN_QUERY_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const room = String(req.query.room ?? (req.body && req.body.room) ?? '');
+  if (!room) return res.status(400).json({ error: 'room required (a room key, or "all")' });
+  if (room !== 'all' && !chatRooms[room]) return res.status(400).json({ error: `unknown room "${room}"` });
+  try {
+    const result = room === 'all'
+      ? await dbRun('DELETE FROM chat_messages')
+      : await dbRun('DELETE FROM chat_messages WHERE room=?', [room]);
+    if (room === 'all') Object.keys(chatRooms).forEach(r => broadcastChat(r, { type: 'chat_room_cleared', room: r }));
+    else broadcastChat(room, { type: 'chat_room_cleared', room });
+    res.json({ ok: true, room, deleted: result?.affectedRows ?? null });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+}
+app.get('/api/admin/clear-chat', _adminClearChat);
+app.post('/api/admin/clear-chat', express.json(), _adminClearChat);
+
 // ─── Trading proxy (KyberSwap aggregator, EVM only) ─────────────────────────
 // Note: KyberSwap does not index testnet liquidity — quotes/swaps will return
 // no route in testnet mode. This mapping is left as mainnet-only slugs.
