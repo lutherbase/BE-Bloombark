@@ -2915,8 +2915,8 @@ async function _pollMoonBotTrades() {
   try {
     const pool = await _resolveMoonBotPool();
     if (!pool) return;
-    const url = `https://api.geckoterminal.com/api/v2/networks/${pool.geckoNetwork}/pools/${pool.poolAddress}/trades?limit=20`;
-    const { data } = await axios.get(url, { timeout: 10000, headers: GECKO_HEADS });
+    const url = `https://api.geckoterminal.com/api/v2/networks/${pool.geckoNetwork}/pools/${pool.poolAddress}/trades?limit=20&_=${Date.now()}`;
+    const { data } = await axios.get(url, { timeout: 10000, headers: { ...GECKO_HEADS, 'Cache-Control': 'no-cache', Pragma: 'no-cache' } });
     const raw = (data?.data || []).slice().reverse(); // oldest → newest, post in order
     const isFirstRun = _moonBotLastTs === 0 && _moonBotSeenTx.size === 0;
     let maxTs = _moonBotLastTs;
