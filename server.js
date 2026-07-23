@@ -1465,7 +1465,7 @@ function fmt_token(v, sym) {
 }
 
 // ─── 8. Build holder stats ──────────────────────────────────────────────────────
-function buildHolderStats(holderData, dex, dsHolderCount) {
+function buildHolderStats(holderData, dex, dsHolderCount, totalSupply) {
   const holders = holderData?.holders || [];
   const top10   = holderData?.top10Pct || 0;
 
@@ -1480,10 +1480,13 @@ function buildHolderStats(holderData, dex, dsHolderCount) {
   // Use provided count or fall back to estimate (never less than RPC-found count)
   const bestTotal = dsHolderCount
     || Math.max(holders.length, txnEstimate, 1);
+  const whales = holders.filter(h => h.supplyPct > 1).length;
 
   return {
     total:         Math.min(bestTotal, 9999999),
-    whales:        holders.filter(h => h.supplyPct > 1).length,
+    whales,
+    retail:        Math.max(0, bestTotal - whales),
+    avgHolding:    totalSupply > 0 && bestTotal > 0 ? totalSupply / bestTotal : null,
     concentration: parseFloat(top10.toFixed(2)),
   };
 }
@@ -1675,7 +1678,7 @@ app.post('/api/analyze', async (req, res) => {
 
     // Holder stats — use real GT count if RPC gave fewer results
     // For Solana, override whale count with real data from RPC
-    const holderStats = buildHolderStats(holderData, merged, realHolderCount);
+    const holderStats = buildHolderStats(holderData, merged, realHolderCount, totalSup);
     if (solanaTopHolders.length) {
       // whales = top 3 traders (proxy since we don't have supply % from public RPC)
       holderStats.whales = Math.min(solanaTopHolders.filter(h => h.type === 'Whale').length, solanaTopHolders.length);
