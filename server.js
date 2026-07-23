@@ -2859,6 +2859,7 @@ async function _resolveMoonBotPool() {
       tokenAddress: p.baseToken?.address || address,
       tokenSymbol:  p.baseToken?.symbol  || '?',
       quoteSymbol:  p.quoteToken?.symbol || 'ETH',
+      marketCapUsd: p.marketCap || p.fdv || null,
     };
     // Pool changed (token swapped, e.g. test token → real $BBRK at launch) —
     // reset dedupe state so we don't compare timestamps across two pools.
@@ -2881,41 +2882,6 @@ const _moonFmtAmt = n => {
   if (n >= 1000) return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
   return n.toLocaleString('en-US', { maximumFractionDigits: n < 1 ? 6 : 4 });
 };
-
-// Bloombark-styled BUY card (green theme, matches _botSvgCard's visual language)
-function _moonBuySvgCard(t) {
-  const svg = `<svg width="520" height="200" viewBox="0 0 520 200" xmlns="http://www.w3.org/2000/svg">
-  <rect width="520" height="200" rx="16" fill="#0d1a12"/>
-  <rect x="0.5" y="0.5" width="519" height="199" rx="16" fill="none" stroke="#27c97f55"/>
-  <rect x="0" y="0" width="520" height="48" rx="16" fill="#0f2419"/>
-  <rect x="0" y="34" width="520" height="14" fill="#0f2419"/>
-  <path d="M22 30 L28 18 L34 30" stroke="#27c97f" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-  <text x="46" y="30" font-family="Menlo, monospace" font-size="13" font-weight="bold" fill="#e2e8f0" letter-spacing="2">BLOOMBUY</text>
-  <rect x="${520-108}" y="13" width="88" height="22" rx="11" fill="#27c97f22" stroke="#27c97f"/>
-  <text x="${520-64}" y="28" font-family="Menlo, monospace" font-size="10" font-weight="bold" fill="#27c97f" text-anchor="middle">BUY</text>
-
-  <text x="26" y="80" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1.5">TOKEN</text>
-  <text x="26" y="104" font-family="Menlo, monospace" font-size="22" font-weight="bold" fill="#e2e8f0">${_svgEsc(t.symbol)}</text>
-
-  <g transform="translate(200,66)">
-    <text x="0" y="0" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1">SPENT</text>
-    <text x="0" y="20" font-family="Menlo, monospace" font-size="15" font-weight="bold" fill="#e2e8f0">${_svgEsc(t.ethAmountStr)}</text>
-  </g>
-  <g transform="translate(340,66)">
-    <text x="0" y="0" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1">USD VALUE</text>
-    <text x="0" y="20" font-family="Menlo, monospace" font-size="15" font-weight="bold" fill="#27c97f">${_svgEsc(t.usdStr)}</text>
-  </g>
-  <g transform="translate(200,110)">
-    <text x="0" y="0" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1">RECEIVED</text>
-    <text x="0" y="20" font-family="Menlo, monospace" font-size="15" font-weight="bold" fill="#e2e8f0">${_svgEsc(t.tokenAmountStr)} ${_svgEsc(t.symbol)}</text>
-  </g>
-
-  <line x1="26" y1="142" x2="494" y2="142" stroke="#1e2235"/>
-  <text x="26" y="166" font-family="Menlo, monospace" font-size="9" fill="#4b5563">Buyer: ${_svgEsc(t.wallet)}</text>
-  <text x="494" y="166" font-family="Menlo, monospace" font-size="9" fill="#4b5563" text-anchor="end">bloombark terminal · not financial advice</text>
-</svg>`;
-  return 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64');
-}
 
 let _moonBotPolling = false;
 async function _pollMoonBotTrades() {
@@ -2950,17 +2916,20 @@ async function _pollMoonBotTrades() {
       const ethAmount   = parseFloat(a.from_token_amount || 0); // quote (ETH) spent
       const tokenAmount = parseFloat(a.to_token_amount   || 0); // base token received
       const usdValue    = parseFloat(a.volume_in_usd || 0);
+      const priceEth    = parseFloat(a.price_to_in_currency_token || 0);
+      const priceUsd    = parseFloat(a.price_to_in_usd || 0);
       const wallet = a.tx_from_address ? shortAddr(a.tx_from_address) : '—';
 
-      const card = _moonBuySvgCard({
-        symbol: pool.tokenSymbol,
-        ethAmountStr:   `${_moonFmtAmt(ethAmount)} ${pool.quoteSymbol}`,
-        usdStr:         _botFmtUsd(usdValue),
-        tokenAmountStr: _moonFmtAmt(tokenAmount),
-        wallet,
-      });
-      const text = `🟢 BUY — ${_moonFmtAmt(ethAmount)} ${pool.quoteSymbol} (${_botFmtUsd(usdValue)}) → ${_moonFmtAmt(tokenAmount)} ${pool.tokenSymbol}`;
-      await _botSend(MOON_BOT_ROOM, text, card, null, { name: BUY_BOT_NAME, avatar: BUY_BOT_AVATAR });
+      const text = `🟢 BUY ALERT\n\n` +
+        `$${pool.tokenSymbol}\n` +
+        `CA: ${pool.tokenAddress}\n` +
+        `MCAP: ${pool.marketCapUsd ? _botFmtUsd(pool.marketCapUsd) : '—'}\n` +
+        `Buy: ${_moonFmtAmt(ethAmount)} ${pool.quoteSymbol} (${_botFmtUsd(usdValue)})\n` +
+        `Price ETH: ${_botFmtPrice(priceEth).replace('$', '')} ${pool.quoteSymbol}\n` +
+        `Price USD: ${_botFmtPrice(priceUsd)}\n` +
+        `Dapat: ${_moonFmtAmt(tokenAmount)} ${pool.tokenSymbol}\n` +
+        `Wallet: ${wallet}`;
+      await _botSend(MOON_BOT_ROOM, text, null, null, { name: BUY_BOT_NAME, avatar: BUY_BOT_AVATAR });
     }
     if (maxTs > _moonBotLastTs) _moonBotLastTs = maxTs;
     _moonBotLastError = null;
