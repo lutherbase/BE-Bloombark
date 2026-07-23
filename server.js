@@ -3956,6 +3956,33 @@ app.get('/api/admin/query', async (req, res) => {
   }
 });
 
+// Token-gated setter for launch-configurable app_config values (ticker + CA).
+// Whitelisted keys only — cannot touch anything else. Same token as the query
+// endpoint; disabled unless ADMIN_QUERY_TOKEN is set. Accepts GET or POST so a
+// plain URL works when direct DB access isn't available.
+async function _adminSetConfig(req, res) {
+  if (!ADMIN_QUERY_TOKEN) return res.status(404).json({ error: 'not enabled' });
+  const token = req.get('x-admin-token') || req.query.token || (req.body && req.body.token) || '';
+  if (token !== ADMIN_QUERY_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const ALLOWED = new Set(['token_ticker', 'contract_address']);
+  const key   = String(req.query.key   ?? (req.body && req.body.key)   ?? '');
+  const value = String(req.query.value ?? (req.body && req.body.value) ?? '');
+  if (!ALLOWED.has(key)) return res.status(400).json({ error: 'key not allowed (token_ticker or contract_address only)' });
+  if (!value) return res.status(400).json({ error: 'value required' });
+  try {
+    await dbRun(
+      "INSERT INTO app_config (`key`, value, updated_at) VALUES (?,?,UNIX_TIMESTAMP()) ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)",
+      [key, value]
+    );
+    const row = await dbGet('SELECT `key`, value FROM app_config WHERE `key`=?', [key]);
+    res.json({ ok: true, updated: row });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+}
+app.get('/api/admin/config', _adminSetConfig);
+app.post('/api/admin/config', express.json(), _adminSetConfig);
+
 // ─── Trading proxy (KyberSwap aggregator, EVM only) ─────────────────────────
 // Note: KyberSwap does not index testnet liquidity — quotes/swaps will return
 // no route in testnet mode. This mapping is left as mainnet-only slugs.
