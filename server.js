@@ -2473,7 +2473,7 @@ const chatRooms = {
   holders:  { name: 'Holders',   icon: '💎', messages: [] },
   private:  { name: 'Private',   icon: '🔐', messages: [] },
   // Read-only BloomBuy feed — no user can post here, enforced below in chat_msg.
-  moon:     { name: '$BBRK Moon',icon: '🌕', messages: [], readOnly: true },
+  moon:     { name: '$BBRK Moon',icon: '🚀', messages: [], readOnly: true },
 };
 const MAX_CHAT_HISTORY = CONFIG.chatHistoryLimit;
 const chatUsers = new Map(); // ws -> { wallet, displayName, joinedAt }
@@ -2649,14 +2649,10 @@ const BOT_CHAINS = new Set(['ethereum', 'base', 'arbitrum', 'polygon', 'optimism
 const _botCooldown = new Map(); // ca -> last reply ts (avoid spamming same CA)
 
 // ─── BloomBuy: posts a card to $BBRK Moon for every on-chain BUY (sells skipped) ──
-const BUY_BOT_NAME = 'BloomBuy';
-const BUY_BOT_AVATAR = 'data:image/svg+xml;base64,' + Buffer.from(
-  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="64" height="64">
-    <rect width="24" height="24" rx="6" fill="#0d2818"/>
-    <path d="M5 16l4-6 3 4 5-8" stroke="#27C97F" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M13 6h5v5" stroke="#27C97F" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-  </svg>`
-).toString('base64');
+// Uses the same Bloombark logo avatar as BloomBot — same brand identity, just a
+// different bot name for the different feed.
+const BUY_BOT_NAME   = 'BloomBuy';
+const BUY_BOT_AVATAR = BOT_AVATAR;
 
 const _svgEsc = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 
