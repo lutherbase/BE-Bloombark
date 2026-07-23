@@ -2637,8 +2637,11 @@ let _holdersGateBasisAt = 0;
 async function _resolveHoldersGateUsdBasis(chain) {
   if (_holdersGateBasis && Date.now() - _holdersGateBasisAt < 5 * 60 * 1000) return _holdersGateBasis;
   try {
-    const caRow = await dbGet("SELECT value FROM app_config WHERE `key`='contract_address'");
-    const addr  = caRow?.value || '';
+    const [caRow, tickerRow] = await Promise.all([
+      dbGet("SELECT value FROM app_config WHERE `key`='contract_address'"),
+      dbGet("SELECT value FROM app_config WHERE `key`='token_ticker'"),
+    ]);
+    const addr = caRow?.value || '';
     if (!_isAddr(addr)) { _holdersGateBasis = null; _holdersGateBasisAt = Date.now(); return null; }
     const { data } = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${addr}`, { timeout: 8000 });
     const pairs = (data?.pairs || [])
@@ -2648,7 +2651,9 @@ async function _resolveHoldersGateUsdBasis(chain) {
     const p = pairs[0];
     _holdersGateBasis = {
       token:  p.baseToken?.address || addr,
-      symbol: p.baseToken?.symbol  || 'TOKEN',
+      // Use the app's own ticker (same one the landing page shows) rather
+      // than the on-chain symbol, so the gate always reads "$BBRK"-style.
+      symbol: '$' + (tickerRow?.value || p.baseToken?.symbol || 'TOKEN'),
       price:  parseFloat(p.priceUsd || 0),
     };
     _holdersGateBasisAt = Date.now();
