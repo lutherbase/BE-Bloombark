@@ -2961,6 +2961,22 @@ async function _pollMoonBotTrades() {
 setTimeout(_pollMoonBotTrades, 8000);
 setInterval(_pollMoonBotTrades, MOON_BOT_POLL_MS);
 
+// Temporary diagnostic — internal poller state isn't visible any other way
+// without log access. Same admin token gate as /api/admin/query.
+app.get('/api/admin/moonbot-status', (req, res) => {
+  if (!ADMIN_QUERY_TOKEN) return res.status(404).json({ error: 'not enabled' });
+  const token = req.get('x-admin-token') || req.query.token || '';
+  if (token !== ADMIN_QUERY_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  res.json({
+    pool: _moonBotPool,
+    poolResolvedAt: _moonBotPoolAt ? new Date(_moonBotPoolAt).toISOString() : null,
+    lastTradeTs: _moonBotLastTs ? new Date(_moonBotLastTs).toISOString() : null,
+    seenTxCount: _moonBotSeenTx.size,
+    currentlyPolling: _moonBotPolling,
+    serverNow: new Date().toISOString(),
+  });
+});
+
 wss.on('connection', (ws) => {
   ws.on('message', async (raw) => {
     try {
