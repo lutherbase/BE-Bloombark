@@ -2887,6 +2887,8 @@ let _moonBotPolling = false;
 async function _pollMoonBotTrades() {
   if (_moonBotPolling) return; // avoid overlapping polls if one runs long
   if (Date.now() < _moonBotBackoffUntil) return; // rate-limited — sit out until backoff clears
+  const enabledRow = await dbGet("SELECT value FROM app_config WHERE `key`='moonbot_enabled'");
+  if (enabledRow && enabledRow.value === 'false') return; // toggled off via /api/admin/config
   _moonBotPolling = true;
   try {
     const pool = await _resolveMoonBotPool();
@@ -2949,11 +2951,13 @@ setInterval(_pollMoonBotTrades, MOON_BOT_POLL_MS);
 
 // Temporary diagnostic — internal poller state isn't visible any other way
 // without log access. Same admin token gate as /api/admin/query.
-app.get('/api/admin/moonbot-status', (req, res) => {
+app.get('/api/admin/moonbot-status', async (req, res) => {
   if (!ADMIN_QUERY_TOKEN) return res.status(404).json({ error: 'not enabled' });
   const token = req.get('x-admin-token') || req.query.token || '';
   if (token !== ADMIN_QUERY_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const enabledRow = await dbGet("SELECT value FROM app_config WHERE `key`='moonbot_enabled'");
   res.json({
+    enabled: !(enabledRow && enabledRow.value === 'false'),
     pool: _moonBotPool,
     poolResolvedAt: _moonBotPoolAt ? new Date(_moonBotPoolAt).toISOString() : null,
     lastTradeTs: _moonBotLastTs ? new Date(_moonBotLastTs).toISOString() : null,
@@ -4127,7 +4131,7 @@ async function _adminSetConfig(req, res) {
   if (!ADMIN_QUERY_TOKEN) return res.status(404).json({ error: 'not enabled' });
   const token = req.get('x-admin-token') || req.query.token || (req.body && req.body.token) || '';
   if (token !== ADMIN_QUERY_TOKEN) return res.status(403).json({ error: 'forbidden' });
-  const ALLOWED = new Set(['token_ticker', 'contract_address']);
+  const ALLOWED = new Set(['token_ticker', 'contract_address', 'moonbot_enabled']);
   const key   = String(req.query.key   ?? (req.body && req.body.key)   ?? '');
   const value = String(req.query.value ?? (req.body && req.body.value) ?? '');
   if (!ALLOWED.has(key)) return res.status(400).json({ error: 'key not allowed (token_ticker or contract_address only)' });
