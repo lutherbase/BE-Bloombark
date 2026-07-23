@@ -2591,7 +2591,7 @@ const CHANNEL_GATES = {
   },
   private: {
     kind:      'paid',
-    chain:     process.env.PRIVATE_GATE_CHAIN    || 'ethereum',
+    chain:     process.env.PRIVATE_GATE_CHAIN    || 'robinhood',
     treasury:  process.env.PRIVATE_GATE_TREASURY || '0xf6a2b3016c7ac86724fa71cd4b3946facb319caa',
     amountEth: parseFloat(process.env.PRIVATE_GATE_AMOUNT_ETH || '0.05'),
     symbol:    'ETH',
