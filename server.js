@@ -2320,8 +2320,17 @@ const _dedupe = arr => arr.filter((p, i, a) =>
   p && a.findIndex(x => x && x.pairAddress === p.pairAddress && x.networkId === p.networkId) === i
 );
 
+// Some chains have ticker-squatting: two unrelated tokens sharing a symbol
+// (e.g. two different "GME" contracts on Robinhood), one of them sometimes
+// ending up as the quote currency for the other — renders as a confusing
+// "GME / gme" row. Drop pairs whose base/quote symbols match case-insensitively.
+const _isSameSymbolPair = p => {
+  const [base, quote] = String(p?.name || '').split(' / ');
+  return !!base && !!quote && base.trim().toLowerCase() === quote.trim().toLowerCase();
+};
+
 const _buildPayload = (dsPairs, chains) => {
-  const pools  = _dedupe(dsPairs.filter(Boolean));
+  const pools  = _dedupe(dsPairs.filter(Boolean)).filter(p => !_isSameSymbolPair(p));
 
   // Backfill token age: DexScreener sometimes omits pairCreatedAt on the exact
   // (highest-volume) pair that lands in the list, while ANOTHER pool of the same
