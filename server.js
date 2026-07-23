@@ -2820,13 +2820,14 @@ const MOON_BOT_CHAIN   = process.env.MOON_BOT_CHAIN || 'ethereum';
 // Until then (value still 'coming_soon'), fall back to a well-known, actively
 // traded token so the channel is verifiable right now: PEPE/Ethereum.
 const MOON_BOT_TEST_TOKEN = process.env.MOON_BOT_TEST_TOKEN || '0x6982508145454Ce325dDbE47a25d4ec3d2311933';
-const MOON_BOT_POLL_MS    = (parseInt(process.env.MOON_BOT_POLL_SEC) || 25) * 1000;
+const MOON_BOT_POLL_MS    = (parseInt(process.env.MOON_BOT_POLL_SEC) || 45) * 1000;
 
 let _moonBotPool   = null;  // { poolAddress, geckoNetwork, chainId, tokenAddress, tokenSymbol, quoteSymbol }
 let _moonBotPoolAt = 0;
 let _moonBotLastTs = 0;     // only trades newer than this get considered
 let _moonBotSeenTx = new Set();
 let _moonBotLastError = null;
+let _moonBotBackoffUntil = 0;  // skip polls until this timestamp after a 429
 
 async function _resolveMoonBotToken() {
   const caRow = await dbGet("SELECT value FROM app_config WHERE `key`='contract_address'");
@@ -2911,12 +2912,13 @@ function _moonBuySvgCard(t) {
 let _moonBotPolling = false;
 async function _pollMoonBotTrades() {
   if (_moonBotPolling) return; // avoid overlapping polls if one runs long
+  if (Date.now() < _moonBotBackoffUntil) return; // rate-limited — sit out until backoff clears
   _moonBotPolling = true;
   try {
     const pool = await _resolveMoonBotPool();
     if (!pool) return;
-    const url = `https://api.geckoterminal.com/api/v2/networks/${pool.geckoNetwork}/pools/${pool.poolAddress}/trades?limit=20&_=${Date.now()}`;
-    const { data } = await axios.get(url, { timeout: 10000, headers: { ...GECKO_HEADS, 'Cache-Control': 'no-cache', Pragma: 'no-cache' } });
+    const url = `https://api.geckoterminal.com/api/v2/networks/${pool.geckoNetwork}/pools/${pool.poolAddress}/trades?limit=20`;
+    const { data } = await axios.get(url, { timeout: 10000, headers: GECKO_HEADS });
     const raw = (data?.data || []).slice().reverse(); // oldest → newest, post in order
     const isFirstRun = _moonBotLastTs === 0 && _moonBotSeenTx.size === 0;
     let maxTs = _moonBotLastTs;
@@ -2954,8 +2956,12 @@ async function _pollMoonBotTrades() {
     }
     if (maxTs > _moonBotLastTs) _moonBotLastTs = maxTs;
     _moonBotLastError = null;
+    _moonBotBackoffUntil = 0;
   } catch (e) {
     _moonBotLastError = { message: e.message, at: new Date().toISOString() };
+    // Rate-limited by GeckoTerminal — back off well past the normal poll
+    // interval so we stop hammering it and let the limit reset.
+    if (e.response?.status === 429) _moonBotBackoffUntil = Date.now() + 3 * 60 * 1000;
     console.error('[moonbot] poll failed:', e.message);
   } finally {
     _moonBotPolling = false;
@@ -2977,6 +2983,7 @@ app.get('/api/admin/moonbot-status', (req, res) => {
     seenTxCount: _moonBotSeenTx.size,
     currentlyPolling: _moonBotPolling,
     lastError: _moonBotLastError,
+    backoffUntil: _moonBotBackoffUntil ? new Date(_moonBotBackoffUntil).toISOString() : null,
     serverNow: new Date().toISOString(),
   });
 });
