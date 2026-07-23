@@ -2814,7 +2814,11 @@ async function _chatBotAnalyze(ca, roomKey, reply = null) {
 // ─── BloomBuy poller: watches recent trades for the configured token, posts a
 // card to $BBRK Moon for every BUY (sells intentionally skipped). ─────────────
 const MOON_BOT_ROOM    = 'moon';
-const MOON_BOT_CHAIN   = process.env.MOON_BOT_CHAIN || 'robinhood';
+// Guard against a stray/misconfigured MOON_BOT_CHAIN env value (e.g. an
+// address pasted into the wrong field) — only accept a value that's
+// actually a known chain key, otherwise fall back to the default.
+const MOON_BOT_CHAIN   = (process.env.MOON_BOT_CHAIN && GECKO_NETWORK[process.env.MOON_BOT_CHAIN])
+  ? process.env.MOON_BOT_CHAIN : 'robinhood';
 // Token to monitor comes from app_config.contract_address — the SAME field the
 // landing page CA uses — so this automatically points at $BBRK once it's live.
 // Until then (value still 'coming_soon'), fall back to a well-known, actively
