@@ -2323,6 +2323,23 @@ const _dedupe = arr => arr.filter((p, i, a) =>
 const _buildPayload = (dsPairs, chains) => {
   const pools  = _dedupe(dsPairs.filter(Boolean));
 
+  // Backfill token age: DexScreener sometimes omits pairCreatedAt on the exact
+  // (highest-volume) pair that lands in the list, while ANOTHER pool of the same
+  // token has it. Use the earliest known creation time per token as its age so
+  // rows like AERO/Base or VIRTUAL/Base don't show "-".
+  const earliestByToken = {};
+  for (const p of pools) {
+    if (!p.createdAt) continue;
+    const k = `${p.address}_${p.networkId}`;
+    const t = new Date(p.createdAt).getTime();
+    if (!earliestByToken[k] || t < earliestByToken[k]) earliestByToken[k] = t;
+  }
+  for (const p of pools) {
+    if (p.createdAt) continue;
+    const k = `${p.address}_${p.networkId}`;
+    if (earliestByToken[k]) p.createdAt = new Date(earliestByToken[k]).toISOString();
+  }
+
   const seenBV = new Set();
   const bestVolume = [...pools]
     .filter(p => p.volume24h > 0)
