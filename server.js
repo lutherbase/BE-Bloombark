@@ -2548,6 +2548,38 @@ app.get('/api/dashboard', async (req, res) => {
   return res.json(hasData ? payload : { ...payload, empty: true });
 });
 
+// ─── Chain-level DEX volume (DefiLlama) ─────────────────────────────────────
+// DexScreener/GeckoTerminal are pool/token-centric — neither exposes a total
+// "volume across this whole chain" figure. DefiLlama's dexs overview does.
+const CHAIN_VOLUME_TTL = 10 * 60 * 1000; // 10 min — this doesn't need to be second-fresh
+const CHAIN_VOLUME_LLAMA_ID = { ethereum: 'ethereum', base: 'base', robinhood: 'robinhood' };
+let _chainVolumeCache = { data: null, at: 0 };
+
+async function _fetchChainVolumes() {
+  const entries = await Promise.all(Object.entries(CHAIN_VOLUME_LLAMA_ID).map(async ([key, llamaId]) => {
+    try {
+      const { data } = await axios.get(
+        `https://api.llama.fi/overview/dexs/${llamaId}?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true`,
+        { timeout: 10000 }
+      );
+      return [key, { volume24h: data?.total24h || 0, volume7d: data?.total7d || 0, change24h: data?.change_1d ?? null }];
+    } catch (e) {
+      console.error(`[chain-volume] ${key} failed:`, e.message);
+      return [key, null];
+    }
+  }));
+  return Object.fromEntries(entries);
+}
+
+app.get('/api/chain-volumes', async (req, res) => {
+  if (_chainVolumeCache.data && Date.now() - _chainVolumeCache.at < CHAIN_VOLUME_TTL) {
+    return res.json({ success: true, data: _chainVolumeCache.data });
+  }
+  const data = await _fetchChainVolumes();
+  _chainVolumeCache = { data, at: Date.now() };
+  res.json({ success: true, data });
+});
+
 // Pre-warm "all" on startup and keep it fresh; per-chain views derive from it.
 setTimeout(() => _fetchDash('all'), CONFIG.dashWarmDelayMs);
 setInterval(() => _fetchDash('all'), DASH_CACHE_TTL);
