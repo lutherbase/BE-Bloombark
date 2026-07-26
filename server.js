@@ -2606,38 +2606,61 @@ app.get('/api/chain-volumes', async (req, res) => {
 // Top Gainers, New Pools — all sourced from GeckoTerminal's per-network
 // endpoints (GeckoTerminal has no native "gainers" endpoint, so that tab is
 // derived by sorting the trending-pools set by 24h price change instead).
-const MARKET_TAB_TTL = 2 * 60 * 1000;
+//
+// Switching tabs just serves whatever's already cached (instant, no live
+// Gecko call) — the frontend's Refresh button is what triggers an actual
+// fetch (?refresh=1). A background timer also keeps the cache warm every
+// 2 minutes so there's real "last updated" data even before anyone hits
+// Refresh themselves.
+const MARKET_TAB_KINDS = { pools: 'pools', trending: 'trending_pools', 'new-pools': 'new_pools' };
+const MARKET_TABS = ['pools', 'trending', 'gainers', 'new-pools'];
+const MARKET_WARM_INTERVAL = 2 * 60 * 1000;
 const _marketTabCache = new Map(); // `${chain}:${tab}` -> { data, at }
+
+async function _fetchMarketTab(chain, tab) {
+  let rows = tab === 'gainers'
+    ? (await _geckoPoolsList(chain, 'trending_pools')).sort((a, b) => b.priceChange24h - a.priceChange24h)
+    : await _geckoPoolsList(chain, MARKET_TAB_KINDS[tab]);
+  rows = rows.slice(0, 30);
+  const cacheKey = `${chain}:${tab}`;
+  // Only cache real results — a transient Gecko failure/rate-limit returns an
+  // empty list, and caching THAT would show "no data" until the next refresh.
+  // Keep serving the last known-good data in that case instead.
+  if (rows.length > 0) _marketTabCache.set(cacheKey, { data: rows, at: Date.now() });
+  return _marketTabCache.get(cacheKey) || { data: rows, at: Date.now() };
+}
+
 app.get('/api/market/:tab', async (req, res) => {
   const tab = req.params.tab;
-  const KIND_BY_TAB = { pools: 'pools', trending: 'trending_pools', 'new-pools': 'new_pools' };
-  if (!KIND_BY_TAB[tab] && tab !== 'gainers') {
-    return res.status(400).json({ error: 'tab must be one of pools, trending, gainers, new-pools' });
+  if (!MARKET_TABS.includes(tab)) {
+    return res.status(400).json({ error: 'tab must be one of ' + MARKET_TABS.join(', ') });
   }
   const enabledChains = await _getEnabledChains();
   const chain = enabledChains.includes(req.query.chain) ? req.query.chain : (enabledChains[0] || 'robinhood');
-
   const cacheKey = `${chain}:${tab}`;
-  const cached = _marketTabCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < MARKET_TAB_TTL) {
-    return res.json({ success: true, chain, data: cached.data });
+
+  if (!req.query.refresh) {
+    const cached = _marketTabCache.get(cacheKey);
+    if (cached) return res.json({ success: true, chain, data: cached.data, lastUpdated: cached.at });
+    // Nothing cached yet (first-ever request for this tab/chain) — fetch once.
   }
 
-  let rows = tab === 'gainers'
-    ? (await _geckoPoolsList(chain, 'trending_pools')).sort((a, b) => b.priceChange24h - a.priceChange24h)
-    : await _geckoPoolsList(chain, KIND_BY_TAB[tab]);
-  rows = rows.slice(0, 30);
-  // Only cache real results — a transient Gecko failure/rate-limit returns an
-  // empty list, and caching THAT would show "no data" to everyone for the
-  // full TTL even once Gecko recovers. Serve stale-but-real data instead if
-  // this fetch came back empty and we have something from before.
-  if (rows.length > 0) {
-    _marketTabCache.set(cacheKey, { data: rows, at: Date.now() });
-  } else if (cached) {
-    return res.json({ success: true, chain, data: cached.data, stale: true });
-  }
-  res.json({ success: true, chain, data: rows });
+  const entry = await _fetchMarketTab(chain, tab);
+  res.json({ success: true, chain, data: entry.data, lastUpdated: entry.at });
 });
+
+// Keep all 4 tabs warm in the background for the primary enabled chain, so
+// there's always real "last updated" data ready without anyone needing to
+// hit Refresh first.
+async function _warmMarketTabs() {
+  const enabledChains = await _getEnabledChains();
+  const chain = enabledChains[0] || 'robinhood';
+  for (const tab of MARKET_TABS) {
+    await _fetchMarketTab(chain, tab).catch(() => {});
+  }
+}
+setTimeout(_warmMarketTabs, CONFIG.dashWarmDelayMs);
+setInterval(_warmMarketTabs, MARKET_WARM_INTERVAL);
 
 // Pre-warm "all" on startup and keep it fresh; per-chain views derive from it.
 setTimeout(() => _fetchDash('all'), CONFIG.dashWarmDelayMs);
