@@ -2702,68 +2702,6 @@ async function _resolveHoldersGateUsdBasis() {
   }
 }
 
-// ── Diamond badge: wallets holding >= 1 ETH's worth of $BBRK get a diamond
-//    next to their chat name. Pegged to live ETH price (not a fixed USD
-//    number) so the bar stays "1 ETH" as ETH moves, same USD-value pattern
-//    as the Holders gate above. ──────────────────────────────────────────
-const WETH_ADDR_BY_CHAIN = {
-  ethereum:  '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-  base:      '0x4200000000000000000000000000000000000006',
-  arbitrum:  '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1',
-  robinhood: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
-};
-let _ethUsdPriceCache = { price: null, chain: null, at: 0 };
-async function _fetchEthUsdPrice(chain) {
-  if (_ethUsdPriceCache.price && _ethUsdPriceCache.chain === chain && Date.now() - _ethUsdPriceCache.at < 5 * 60 * 1000) {
-    return _ethUsdPriceCache.price;
-  }
-  const weth = WETH_ADDR_BY_CHAIN[chain];
-  if (!weth) return null;
-  try {
-    const { data } = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${weth}`, { timeout: 8000 });
-    const pairs = (data?.pairs || []).filter(p => p.chainId === chain).sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-    const p = pairs[0];
-    if (!p) return null;
-    // DexScreener's priceUsd is always the BASE token's price. WETH usually
-    // isn't the base of the highest-liquidity pair (e.g. on Robinhood every
-    // pool has some other token as base and WETH as quote) — in that case
-    // derive WETH's own price as priceUsd / priceNative instead of reading
-    // priceUsd directly (which would silently return the wrong token's price).
-    const isWethBase = String(p.baseToken?.address).toLowerCase() === weth.toLowerCase();
-    const price = isWethBase
-      ? parseFloat(p.priceUsd || 0)
-      : parseFloat(p.priceUsd || 0) / (parseFloat(p.priceNative || 0) || 1);
-    if (price > 0) _ethUsdPriceCache = { price, chain, at: Date.now() };
-    return price > 0 ? price : null;
-  } catch (e) {
-    console.error('[diamond-badge] ETH price fetch failed:', e.message);
-    return _ethUsdPriceCache.chain === chain ? _ethUsdPriceCache.price : null;
-  }
-}
-
-const _diamondCache = new Map(); // wallet -> { val, ts }
-async function isDiamondHolder(wallet) {
-  if (!_isAddr(wallet)) return false;
-  const key = wallet.toLowerCase();
-  const cached = _diamondCache.get(key);
-  if (cached && Date.now() - cached.ts < CONFIG.gateCacheTtlMs) return cached.val;
-
-  let val = false;
-  try {
-    const basis = await _resolveHoldersGateUsdBasis();
-    if (basis && basis.price > 0) {
-      const ethUsd = await _fetchEthUsdPrice(basis.chain);
-      if (ethUsd > 0) {
-        const minAmount = ethUsd / basis.price; // token qty worth 1 ETH right now
-        const balance = await _erc20BalanceOf(chainCfg(basis.chain).rpc, basis.token, wallet);
-        val = balance >= minAmount;
-      }
-    }
-  } catch (_) {}
-  _diamondCache.set(key, { val, ts: Date.now() });
-  return val;
-}
-
 // Returns { gated, ok, kind, ... } — shape varies slightly by gate kind (see below).
 async function checkChannelGate(room, wallet) {
   const gate = CHANNEL_GATES[room];
@@ -3258,10 +3196,12 @@ wss.on('connection', (ws) => {
           }
           roomRows[k] = await dbAll('SELECT * FROM chat_messages WHERE room=? ORDER BY ts DESC LIMIT ?', [k, MAX_CHAT_HISTORY]);
         }
-        // Resolve the diamond badge once per unique wallet across all rooms'
-        // history (not per message) — each check is an RPC balance call.
+        // Diamond badge = same check as Holders channel access (inline reuse
+        // of checkChannelGate, same $90 threshold, same cache) — whoever can
+        // open Holders gets the badge, and loses it the moment they can't.
+        // Resolved once per unique wallet across all rooms' history, not per message.
         const _uniqueWallets = [...new Set(Object.values(roomRows).flat().map(r => r.wallet).filter(Boolean))];
-        const _diamondEntries = await Promise.all(_uniqueWallets.map(async w => [w, await isDiamondHolder(w)]));
+        const _diamondEntries = await Promise.all(_uniqueWallets.map(async w => [w, (await checkChannelGate('holders', w)).ok]));
         const _diamondMap = Object.fromEntries(_diamondEntries);
         for (const k of Object.keys(roomRows)) {
           history[k] = roomRows[k].reverse().map(r => ({
@@ -3329,7 +3269,7 @@ wss.on('connection', (ws) => {
           imgData,
           ts: Date.now(),
           isSenderAdmin: user.isAdmin,
-          isDiamondHolder: user.wallet ? await isDiamondHolder(user.wallet) : false,
+          isDiamondHolder: user.wallet ? (await checkChannelGate('holders', user.wallet)).ok : false,
           replyTo, replyName, replyText,
         };
         // Persist to DB
