@@ -2627,7 +2627,15 @@ app.get('/api/market/:tab', async (req, res) => {
     ? (await _geckoPoolsList(chain, 'trending_pools')).sort((a, b) => b.priceChange24h - a.priceChange24h)
     : await _geckoPoolsList(chain, KIND_BY_TAB[tab]);
   rows = rows.slice(0, 30);
-  _marketTabCache.set(cacheKey, { data: rows, at: Date.now() });
+  // Only cache real results — a transient Gecko failure/rate-limit returns an
+  // empty list, and caching THAT would show "no data" to everyone for the
+  // full TTL even once Gecko recovers. Serve stale-but-real data instead if
+  // this fetch came back empty and we have something from before.
+  if (rows.length > 0) {
+    _marketTabCache.set(cacheKey, { data: rows, at: Date.now() });
+  } else if (cached) {
+    return res.json({ success: true, chain, data: cached.data, stale: true });
+  }
   res.json({ success: true, chain, data: rows });
 });
 
