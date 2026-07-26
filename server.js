@@ -2602,6 +2602,45 @@ app.get('/api/chain-volumes', async (req, res) => {
   res.json({ success: true, data: filtered });
 });
 
+// ─── Chain-level transaction activity (Blockscout) — network-wide tx count,
+// not DEX-specific. Every chain we support already has a Blockscout instance
+// (chainCfg(...).blockscout), and its /api/v2/stats endpoint is standardized
+// across instances since it's the same open-source explorer software. ──────
+const CHAIN_TX_TTL = 10 * 60 * 1000;
+let _chainTxCache = { data: null, at: 0 };
+
+async function _fetchChainTransactions() {
+  const chains = Object.keys(CHAIN_NETWORKS);
+  const entries = await Promise.all(chains.map(async (key) => {
+    try {
+      const base = chainCfg(key).blockscout;
+      if (!base) return [key, null];
+      const { data } = await axios.get(`${base}/api/v2/stats`, { timeout: 10000 });
+      return [key, {
+        transactionsToday: parseInt(data?.transactions_today || 0),
+        totalTransactions: parseInt(data?.total_transactions || 0),
+      }];
+    } catch (e) {
+      console.error(`[chain-tx] ${key} failed:`, e.message);
+      return [key, null];
+    }
+  }));
+  return Object.fromEntries(entries);
+}
+
+app.get('/api/chain-transactions', async (req, res) => {
+  const enabledChains = await _getEnabledChains();
+  let data;
+  if (_chainTxCache.data && Date.now() - _chainTxCache.at < CHAIN_TX_TTL) {
+    data = _chainTxCache.data;
+  } else {
+    data = await _fetchChainTransactions();
+    _chainTxCache = { data, at: Date.now() };
+  }
+  const filtered = Object.fromEntries(Object.entries(data).filter(([k, v]) => enabledChains.includes(k) && v));
+  res.json({ success: true, data: filtered });
+});
+
 // ─── Market Overview tabs (Robinhood-chain launch view): Pools, Trending,
 // Top Gainers, New Pools — all sourced from GeckoTerminal's per-network
 // endpoints (GeckoTerminal has no native "gainers" endpoint, so that tab is
