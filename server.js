@@ -1491,6 +1491,17 @@ function buildHolderStats(holderData, dex, dsHolderCount, totalSupply) {
   };
 }
 
+// Which chains are turned on right now — default launch config is Robinhood
+// only. Toggle via /api/admin/config?key=enabled_chains&value=robinhood,ethereum,base
+let _enabledChainsCache = { list: null, at: 0 };
+async function _getEnabledChains() {
+  if (_enabledChainsCache.list && Date.now() - _enabledChainsCache.at < 5 * 60 * 1000) return _enabledChainsCache.list;
+  const row = await dbGet("SELECT value FROM app_config WHERE `key`='enabled_chains'");
+  const list = (row?.value || 'robinhood').split(',').map(s => s.trim()).filter(Boolean);
+  _enabledChainsCache = { list, at: Date.now() };
+  return list;
+}
+
 // ─── Main API Endpoint ─────────────────────────────────────────────────────────
 app.post('/api/analyze', async (req, res) => {
   const { contractAddress, chain: requestedChain } = req.body;
@@ -1519,6 +1530,11 @@ app.post('/api/analyze', async (req, res) => {
     const actualGecko   = GECKO_NETWORK[actualChain] || geckoNetwork;
 
     console.log(`  → actual chain: ${actualChain} (gecko: ${actualGecko})`);
+
+    const enabledChains = await _getEnabledChains();
+    if (!enabledChains.includes(actualChain)) {
+      return res.status(400).json({ error: `${actualChain} isn't enabled yet — currently supported: ${enabledChains.join(', ')}` });
+    }
 
     // ── Parallel fetch: GeckoTerminal only (no Solana RPC) ──────────────────────
     const [gecko, geckoPools, geckoInfo] = await Promise.all([
@@ -2400,16 +2416,16 @@ const _buildPayload = (dsPairs, chains) => {
 
 const _dsGet = url => axios.get(url, { timeout: 8000 }).catch(() => null);
 
-// Real "what's trending right now" data — one call per chain, additive to the
-// fixed DexScreener token/search lists above. Failures (incl. 429) are
-// swallowed here just like _dsGet so a Gecko hiccup never breaks the
-// dashboard; it only means fewer fresh entries that refresh cycle.
-async function _geckoTrendingPools(chainId) {
+// Real "what's happening right now" pool data from GeckoTerminal's per-network
+// endpoints (pools / trending_pools / new_pools) — one call per chain per
+// endpoint kind. Failures (incl. 429) are swallowed so a Gecko hiccup never
+// breaks the dashboard; it only means fewer fresh entries that refresh cycle.
+async function _geckoPoolsList(chainId, kind = 'trending_pools') {
   const network = GECKO_NETWORK[chainId];
   if (!network) return [];
   try {
     const { data } = await axios.get(
-      `https://api.geckoterminal.com/api/v2/networks/${network}/trending_pools?limit=20&include=base_token,quote_token`,
+      `https://api.geckoterminal.com/api/v2/networks/${network}/${kind}?limit=20&include=base_token,quote_token`,
       { timeout: 8000, headers: GECKO_HEADS }
     );
     const included = {};
@@ -2440,10 +2456,11 @@ async function _geckoTrendingPools(chainId) {
       };
     }).filter(Boolean);
   } catch (e) {
-    console.error(`[dash] gecko trending failed [${chainId}]:`, e.message);
+    console.error(`[market] gecko ${kind} failed [${chainId}]:`, e.message);
     return [];
   }
 }
+const _geckoTrendingPools = chainId => _geckoPoolsList(chainId, 'trending_pools');
 
 async function _fetchDash(key) {
   if (_dashFetching[key]) return;
@@ -2572,12 +2589,46 @@ async function _fetchChainVolumes() {
 }
 
 app.get('/api/chain-volumes', async (req, res) => {
+  const enabledChains = await _getEnabledChains();
+  let data;
   if (_chainVolumeCache.data && Date.now() - _chainVolumeCache.at < CHAIN_VOLUME_TTL) {
-    return res.json({ success: true, data: _chainVolumeCache.data });
+    data = _chainVolumeCache.data;
+  } else {
+    data = await _fetchChainVolumes();
+    _chainVolumeCache = { data, at: Date.now() };
   }
-  const data = await _fetchChainVolumes();
-  _chainVolumeCache = { data, at: Date.now() };
-  res.json({ success: true, data });
+  // Only surface chains that are actually turned on (default: Robinhood only).
+  const filtered = Object.fromEntries(Object.entries(data).filter(([k]) => enabledChains.includes(k)));
+  res.json({ success: true, data: filtered });
+});
+
+// ─── Market Overview tabs (Robinhood-chain launch view): Pools, Trending,
+// Top Gainers, New Pools — all sourced from GeckoTerminal's per-network
+// endpoints (GeckoTerminal has no native "gainers" endpoint, so that tab is
+// derived by sorting the trending-pools set by 24h price change instead).
+const MARKET_TAB_TTL = 2 * 60 * 1000;
+const _marketTabCache = new Map(); // `${chain}:${tab}` -> { data, at }
+app.get('/api/market/:tab', async (req, res) => {
+  const tab = req.params.tab;
+  const KIND_BY_TAB = { pools: 'pools', trending: 'trending_pools', 'new-pools': 'new_pools' };
+  if (!KIND_BY_TAB[tab] && tab !== 'gainers') {
+    return res.status(400).json({ error: 'tab must be one of pools, trending, gainers, new-pools' });
+  }
+  const enabledChains = await _getEnabledChains();
+  const chain = enabledChains.includes(req.query.chain) ? req.query.chain : (enabledChains[0] || 'robinhood');
+
+  const cacheKey = `${chain}:${tab}`;
+  const cached = _marketTabCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < MARKET_TAB_TTL) {
+    return res.json({ success: true, chain, data: cached.data });
+  }
+
+  let rows = tab === 'gainers'
+    ? (await _geckoPoolsList(chain, 'trending_pools')).sort((a, b) => b.priceChange24h - a.priceChange24h)
+    : await _geckoPoolsList(chain, KIND_BY_TAB[tab]);
+  rows = rows.slice(0, 30);
+  _marketTabCache.set(cacheKey, { data: rows, at: Date.now() });
+  res.json({ success: true, chain, data: rows });
 });
 
 // Pre-warm "all" on startup and keep it fresh; per-chain views derive from it.
@@ -4277,9 +4328,10 @@ app.post('/api/profile', express.json({ limit: '8mb' }), async (req, res) => {
 
 // ─── Public config endpoint ─────────────────────────────────────────────────
 app.get('/api/config/public', async (req, res) => {
-  const [ca, ticker] = await Promise.all([
+  const [ca, ticker, enabledChains] = await Promise.all([
     dbGet("SELECT value FROM app_config WHERE `key`='contract_address'"),
     dbGet("SELECT value FROM app_config WHERE `key`='token_ticker'"),
+    _getEnabledChains(),
   ]);
   res.json({
     contractAddress: ca?.value || 'coming_soon',
@@ -4287,6 +4339,9 @@ app.get('/api/config/public', async (req, res) => {
     networkEnv: NETWORK_ENV,
     isTestnet: IS_TESTNET,
     chains: Object.fromEntries(Object.keys(CHAIN_NETWORKS).map(k => [k, chainCfg(k)])),
+    // Which chains are actually turned on right now — default launch config is
+    // Robinhood-only; set via /api/admin/config?key=enabled_chains&value=robinhood,ethereum,base
+    enabledChains,
   });
 });
 
@@ -4337,7 +4392,7 @@ async function _adminSetConfig(req, res) {
   if (!ADMIN_QUERY_TOKEN) return res.status(404).json({ error: 'not enabled' });
   const token = req.get('x-admin-token') || req.query.token || (req.body && req.body.token) || '';
   if (token !== ADMIN_QUERY_TOKEN) return res.status(403).json({ error: 'forbidden' });
-  const ALLOWED = new Set(['token_ticker', 'contract_address', 'moonbot_enabled']);
+  const ALLOWED = new Set(['token_ticker', 'contract_address', 'moonbot_enabled', 'enabled_chains']);
   const key   = String(req.query.key   ?? (req.body && req.body.key)   ?? '');
   const value = String(req.query.value ?? (req.body && req.body.value) ?? '');
   if (!ALLOWED.has(key)) return res.status(400).json({ error: 'key not allowed (token_ticker or contract_address only)' });
