@@ -3198,6 +3198,7 @@ wss.on('connection', (ws) => {
             id: r.id, room: r.room, wallet: r.wallet, displayName: r.display_name,
             avatar: r.avatar, text: r.text, imgData: r.img_data, ts: r.ts,
             isBot: (r.display_name === BOT_NAME || r.display_name === BUY_BOT_NAME) && r.wallet == null,
+            isSenderAdmin: isAdminWallet(r.wallet),
             replyTo: r.reply_to, replyName: r.reply_name, replyText: r.reply_text,
             edited: !!r.edited,
           }));
@@ -3256,6 +3257,7 @@ wss.on('connection', (ws) => {
           text,
           imgData,
           ts: Date.now(),
+          isSenderAdmin: user.isAdmin,
           replyTo, replyName, replyText,
         };
         // Persist to DB
