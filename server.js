@@ -143,6 +143,43 @@ async function initDb() {
       UNIQUE KEY uniq_wallet_address (wallet, address)
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS token_alerts (
+      id              INT PRIMARY KEY AUTO_INCREMENT,
+      wallet          VARCHAR(255) NOT NULL,
+      address         VARCHAR(255) NOT NULL,
+      chain           VARCHAR(64),
+      name            VARCHAR(255),
+      symbol          VARCHAR(64),
+      metric          VARCHAR(16) NOT NULL,
+      baseline_value  DOUBLE NOT NULL,
+      threshold_pct   DOUBLE NOT NULL,
+      direction       VARCHAR(8) NOT NULL DEFAULT 'both',
+      active          TINYINT NOT NULL DEFAULT 1,
+      created_at      INT DEFAULT (UNIX_TIMESTAMP()),
+      last_checked_at INT,
+      UNIQUE KEY uniq_wallet_address_metric (wallet, address, metric)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alert_notifications (
+      id             INT PRIMARY KEY AUTO_INCREMENT,
+      alert_id       INT,
+      wallet         VARCHAR(255) NOT NULL,
+      address        VARCHAR(255) NOT NULL,
+      chain          VARCHAR(64),
+      name           VARCHAR(255),
+      symbol         VARCHAR(64),
+      metric         VARCHAR(16) NOT NULL,
+      direction      VARCHAR(8) NOT NULL,
+      baseline_value DOUBLE,
+      new_value      DOUBLE,
+      change_pct     DOUBLE,
+      message        TEXT,
+      ts             BIGINT NOT NULL,
+      is_read        TINYINT NOT NULL DEFAULT 0
+    )
+  `);
   // Community: paid-channel unlocks (one-time on-chain payment, verified then recorded here)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS channel_payments (
@@ -4009,6 +4046,101 @@ app.delete('/api/watchlist/:address', requireAuth, async (req, res) => {
   await dbRun('DELETE FROM watchlist WHERE wallet=? AND address=?', [req.user.wallet, req.params.address.toLowerCase()]);
   res.json({ success: true });
 });
+
+// ─── Token Alerts (per-watchlist-item MCAP/Volume % move alerts) ────────────
+// (tables created in initDb())
+
+app.get('/api/alerts', requireAuth, async (req, res) => {
+  const rows = await dbAll('SELECT * FROM token_alerts WHERE wallet=? ORDER BY created_at DESC', [req.user.wallet]);
+  res.json({ success: true, items: rows });
+});
+
+app.post('/api/alerts', requireAuth, async (req, res) => {
+  const { address, chain, name, symbol, metric, baselineValue, thresholdPct, direction } = req.body;
+  if (!address || !chain) return res.status(400).json({ error: 'address and chain required' });
+  if (!['mcap', 'volume'].includes(metric)) return res.status(400).json({ error: 'metric must be mcap or volume' });
+  const dir = ['up', 'down', 'both'].includes(direction) ? direction : 'both';
+  const baseline = parseFloat(baselineValue);
+  const threshold = parseFloat(thresholdPct);
+  if (!(baseline > 0)) return res.status(400).json({ error: 'baselineValue must be > 0' });
+  if (!(threshold > 0)) return res.status(400).json({ error: 'thresholdPct must be > 0' });
+  await dbRun(`
+    INSERT INTO token_alerts (wallet, address, chain, name, symbol, metric, baseline_value, threshold_pct, direction, active)
+    VALUES (?,?,?,?,?,?,?,?,?,1)
+    ON DUPLICATE KEY UPDATE chain=VALUES(chain), name=VALUES(name), symbol=VALUES(symbol),
+      baseline_value=VALUES(baseline_value), threshold_pct=VALUES(threshold_pct), direction=VALUES(direction), active=1
+  `, [req.user.wallet, address.toLowerCase(), chain, name || '', symbol || '', metric, baseline, threshold, dir]);
+  res.json({ success: true });
+});
+
+app.delete('/api/alerts/:id', requireAuth, async (req, res) => {
+  await dbRun('DELETE FROM token_alerts WHERE id=? AND wallet=?', [req.params.id, req.user.wallet]);
+  res.json({ success: true });
+});
+
+app.delete('/api/alerts/token/:address', requireAuth, async (req, res) => {
+  await dbRun('DELETE FROM token_alerts WHERE wallet=? AND address=?', [req.user.wallet, req.params.address.toLowerCase()]);
+  res.json({ success: true });
+});
+
+app.get('/api/alerts/notifications', requireAuth, async (req, res) => {
+  const rows = await dbAll('SELECT * FROM alert_notifications WHERE wallet=? ORDER BY ts DESC LIMIT 100', [req.user.wallet]);
+  const unread = rows.filter(r => !r.is_read).length;
+  res.json({ success: true, items: rows, unread });
+});
+
+app.post('/api/alerts/notifications/mark-read', requireAuth, async (req, res) => {
+  await dbRun('UPDATE alert_notifications SET is_read=1 WHERE wallet=?', [req.user.wallet]);
+  res.json({ success: true });
+});
+
+// Background checker: periodically compares each active alert's current MCAP/Volume
+// (via DexScreener) against its baseline + threshold%, fires a notification and
+// deactivates the alert (one-shot) when the move is crossed.
+async function _checkTokenAlerts() {
+  let alerts;
+  try {
+    alerts = await dbAll('SELECT * FROM token_alerts WHERE active=1');
+  } catch (e) { console.error('[alerts] load failed:', e.message); return; }
+  for (const a of alerts) {
+    try {
+      const { data } = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${a.address}`, { timeout: 8000 });
+      const pairs = (data?.pairs || []).filter(p => p.chainId === a.chain)
+        .sort((x, y) => (y.liquidity?.usd || 0) - (x.liquidity?.usd || 0));
+      if (!pairs.length) continue;
+      const p = pairs[0];
+      const currentValue = a.metric === 'mcap'
+        ? parseFloat(p.fdv || p.marketCap || 0)
+        : parseFloat(p.volume?.h24 || 0);
+      if (!(currentValue > 0)) continue;
+
+      const changePct = ((currentValue - a.baseline_value) / a.baseline_value) * 100;
+      const crossedUp = changePct >= a.threshold_pct;
+      const crossedDown = changePct <= -a.threshold_pct;
+      const shouldFire = (a.direction === 'up' && crossedUp) ||
+                          (a.direction === 'down' && crossedDown) ||
+                          (a.direction === 'both' && (crossedUp || crossedDown));
+
+      if (shouldFire) {
+        const dir = changePct >= 0 ? 'up' : 'down';
+        const label = a.metric === 'mcap' ? 'Market Cap' : 'Volume';
+        const message = `${a.symbol || a.name || 'Token'} ${label} moved ${dir} ${Math.abs(changePct).toFixed(1)}% (threshold ${a.threshold_pct}%)`;
+        await dbRun(`
+          INSERT INTO alert_notifications (alert_id, wallet, address, chain, name, symbol, metric, direction, baseline_value, new_value, change_pct, message, ts)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `, [a.id, a.wallet, a.address, a.chain, a.name, a.symbol, a.metric, dir, a.baseline_value, currentValue, changePct, message, Date.now()]);
+        await dbRun('UPDATE token_alerts SET active=0, last_checked_at=? WHERE id=?', [Math.floor(Date.now() / 1000), a.id]);
+      } else {
+        await dbRun('UPDATE token_alerts SET last_checked_at=? WHERE id=?', [Math.floor(Date.now() / 1000), a.id]);
+      }
+    } catch (e) {
+      console.error('[alerts] check failed for', a.address, e.message);
+    }
+    await new Promise(r => setTimeout(r, 300)); // gentle pacing between DexScreener calls
+  }
+}
+setTimeout(_checkTokenAlerts, 20000);
+setInterval(_checkTokenAlerts, 5 * 60 * 1000);
 
 // In-memory cache for wallet-map and solana trader data (5 min TTL)
 const _walletMapCache = new Map();
