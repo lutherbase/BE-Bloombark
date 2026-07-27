@@ -2565,6 +2565,26 @@ app.get('/api/dashboard', async (req, res) => {
   return res.json(hasData ? payload : { ...payload, empty: true });
 });
 
+// ─── Generic app_config-backed cache persistence — same pattern as the
+// narrative cache above, reused for Market Overview's three data sources
+// (chain volume, chain transactions, market tabs) so a cold boot (Render
+// free-tier spin-down/restart) serves last-known-good data immediately
+// instead of an empty state, and gets replaced the moment fresh data lands.
+async function _saveGenericCacheToDb(configKey, value) {
+  try {
+    await dbRun(
+      "INSERT INTO app_config (`key`, value, updated_at) VALUES (?,?,UNIX_TIMESTAMP()) ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)",
+      [configKey, JSON.stringify(value)]
+    );
+  } catch (e) { console.error(`[cache-persist] failed to save ${configKey}:`, e.message); }
+}
+async function _loadGenericCacheFromDb(configKey) {
+  try {
+    const row = await dbGet('SELECT value FROM app_config WHERE `key`=?', [configKey]);
+    return row ? JSON.parse(row.value) : null;
+  } catch (e) { console.error(`[cache-persist] failed to load ${configKey}:`, e.message); return null; }
+}
+
 // ─── Chain-level DEX volume (DefiLlama) ─────────────────────────────────────
 // DexScreener/GeckoTerminal are pool/token-centric — neither exposes a total
 // "volume across this whole chain" figure. DefiLlama's dexs overview does.
@@ -2596,6 +2616,7 @@ app.get('/api/chain-volumes', async (req, res) => {
   } else {
     data = await _fetchChainVolumes();
     _chainVolumeCache = { data, at: Date.now() };
+    _saveGenericCacheToDb('market_chain_volume_cache', _chainVolumeCache);
   }
   // Only surface chains that are actually turned on (default: Robinhood only).
   const filtered = Object.fromEntries(Object.entries(data).filter(([k]) => enabledChains.includes(k)));
@@ -2636,6 +2657,7 @@ app.get('/api/chain-transactions', async (req, res) => {
   } else {
     data = await _fetchChainTransactions();
     _chainTxCache = { data, at: Date.now() };
+    _saveGenericCacheToDb('market_chain_tx_cache', _chainTxCache);
   }
   const filtered = Object.fromEntries(Object.entries(data).filter(([k, v]) => enabledChains.includes(k) && v));
   res.json({ success: true, data: filtered });
@@ -2665,7 +2687,10 @@ async function _fetchMarketTab(chain, tab) {
   // Only cache real results — a transient Gecko failure/rate-limit returns an
   // empty list, and caching THAT would show "no data" until the next refresh.
   // Keep serving the last known-good data in that case instead.
-  if (rows.length > 0) _marketTabCache.set(cacheKey, { data: rows, at: Date.now() });
+  if (rows.length > 0) {
+    _marketTabCache.set(cacheKey, { data: rows, at: Date.now() });
+    _saveGenericCacheToDb('market_tab_cache', Object.fromEntries(_marketTabCache));
+  }
   return _marketTabCache.get(cacheKey) || { data: rows, at: Date.now() };
 }
 
@@ -4631,6 +4656,19 @@ app.get('/api/trade/quote/evm', async (req, res) => {
 initDb()
   .then(async () => {
     await _loadNarrativeCacheFromDb();
+    // Restore Market Overview's three data sources so a cold boot serves
+    // last-known-good data immediately instead of an empty state.
+    const [volCache, txCache, tabCache] = await Promise.all([
+      _loadGenericCacheFromDb('market_chain_volume_cache'),
+      _loadGenericCacheFromDb('market_chain_tx_cache'),
+      _loadGenericCacheFromDb('market_tab_cache'),
+    ]);
+    if (volCache?.data) { _chainVolumeCache = volCache; console.log(`[market] restored chain-volume cache from DB (age ${Math.round((Date.now()-volCache.at)/60000)}min)`); }
+    if (txCache?.data) { _chainTxCache = txCache; console.log(`[market] restored chain-tx cache from DB (age ${Math.round((Date.now()-txCache.at)/60000)}min)`); }
+    if (tabCache) {
+      for (const [k, v] of Object.entries(tabCache)) _marketTabCache.set(k, v);
+      console.log(`[market] restored ${Object.keys(tabCache).length} market-tab cache entries from DB`);
+    }
     server.listen(PORT, () => console.log(`Bloombark Terminal Backend running on port ${PORT}`));
   })
   .catch((e) => {
