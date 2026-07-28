@@ -4025,7 +4025,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   const user = await dbGet('SELECT id, wallet, generated_address, created_at, last_login FROM users WHERE wallet=?', [req.user.wallet]);
   if (!user) return res.status(404).json({ error: 'User not found' });
-  return res.json({ success: true, user });
+  return res.json({ success: true, user, isAdmin: isAdminWallet(req.user.wallet) });
 });
 
 // ─── POST /api/auth/logout ──────────────────────────────────────────────────────
