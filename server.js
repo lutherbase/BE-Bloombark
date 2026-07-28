@@ -4746,6 +4746,11 @@ app.post('/api/admin/clear-chat', express.json(), _adminClearChat);
 // Note: KyberSwap does not index testnet liquidity — quotes/swaps will return
 // no route in testnet mode. This mapping is left as mainnet-only slugs.
 const KYBER_CHAINS = { ethereum:'ethereum', base:'base', arbitrum:'arbitrum', polygon:'polygon', optimism:'optimism', avalanche:'avalanche', robinhood:'robinhood' };
+// Platform fee on every trade — deducted by KyberSwap's router itself as part
+// of the swap tx and sent straight to the treasury (same wallet the Private
+// channel payment goes to). 5 bps = 0.05%.
+const TRADE_FEE_BPS      = 5;
+const TRADE_FEE_TREASURY = process.env.PRIVATE_GATE_TREASURY || '0xf6a2b3016c7ac86724fa71cd4b3946facb319caa';
 const RPC_URLS = Object.fromEntries(Object.keys(CHAIN_NETWORKS).map(k => [k, chainCfg(k).rpc]));
 
 // Get best swap route
@@ -4777,6 +4782,10 @@ app.post('/api/trade/kyber/build', express.json({ limit: '1mb' }), async (req, r
       recipient: sender,
       slippageTolerance: Math.min(Math.max(parseInt(slippageBps) || 100, 5), 2000),
       source: 'bloombark',
+      feeReceiver: TRADE_FEE_TREASURY,
+      chargeFeeBy: 'currency_in',
+      feeAmount: String(TRADE_FEE_BPS),
+      isInBps: true,
     }, { headers: { 'x-client-id': 'bloombark' }, timeout: 10000 });
     res.json(r.data);
   } catch (e) {
