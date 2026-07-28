@@ -4150,6 +4150,19 @@ app.post('/api/admin/alerts/blast', requireAuth, async (req, res) => {
   res.json({ success: true, sent: users.length });
 });
 
+// Admin: clear broadcasted Bloombark-update notifications across ALL users
+// (e.g. to retract a blast sent by mistake). Pass { ts } to clear only one
+// specific blast batch (every row from one blast shares the same ts), or
+// omit it to clear every bloombark_update notification for every user.
+app.post('/api/admin/alerts/blast/clear', requireAuth, async (req, res) => {
+  if (!isAdminWallet(req.user.wallet)) return res.status(403).json({ error: 'Forbidden' });
+  const ts = req.body?.ts ? Number(req.body.ts) : null;
+  const result = ts
+    ? await dbRun('DELETE FROM alert_notifications WHERE category=? AND ts=?', ['bloombark_update', ts])
+    : await dbRun('DELETE FROM alert_notifications WHERE category=?', ['bloombark_update']);
+  res.json({ success: true, deleted: result.affectedRows });
+});
+
 // Background checker: periodically compares each active alert's current MCAP/Volume
 // (via DexScreener) against its baseline + threshold%, fires a notification and
 // deactivates the alert (one-shot) when the move is crossed.
