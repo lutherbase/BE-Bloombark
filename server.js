@@ -161,6 +161,11 @@ async function initDb() {
       UNIQUE KEY uniq_wallet_address_metric (wallet, address, metric)
     )
   `);
+  // High/low watermarks reached since the baseline was set — lets the checker
+  // catch a threshold that was crossed and reverted between two poll cycles,
+  // instead of only comparing the snapshot value at check time.
+  await _addCol('ALTER TABLE token_alerts ADD COLUMN high_value DOUBLE');
+  await _addCol('ALTER TABLE token_alerts ADD COLUMN low_value DOUBLE');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS alert_notifications (
       id             INT PRIMARY KEY AUTO_INCREMENT,
@@ -4085,11 +4090,12 @@ app.post('/api/alerts', requireAuth, async (req, res) => {
   if (!(baseline > 0)) return res.status(400).json({ error: 'baselineValue must be > 0' });
   if (!(threshold > 0)) return res.status(400).json({ error: 'thresholdPct must be > 0' });
   await dbRun(`
-    INSERT INTO token_alerts (wallet, address, chain, name, symbol, metric, baseline_value, threshold_pct, direction, active)
-    VALUES (?,?,?,?,?,?,?,?,?,1)
+    INSERT INTO token_alerts (wallet, address, chain, name, symbol, metric, baseline_value, threshold_pct, direction, active, high_value, low_value)
+    VALUES (?,?,?,?,?,?,?,?,?,1,?,?)
     ON DUPLICATE KEY UPDATE chain=VALUES(chain), name=VALUES(name), symbol=VALUES(symbol),
-      baseline_value=VALUES(baseline_value), threshold_pct=VALUES(threshold_pct), direction=VALUES(direction), active=1
-  `, [req.user.wallet, address.toLowerCase(), chain, name || '', symbol || '', metric, baseline, threshold, dir]);
+      baseline_value=VALUES(baseline_value), threshold_pct=VALUES(threshold_pct), direction=VALUES(direction), active=1,
+      high_value=VALUES(high_value), low_value=VALUES(low_value)
+  `, [req.user.wallet, address.toLowerCase(), chain, name || '', symbol || '', metric, baseline, threshold, dir, baseline, baseline]);
   res.json({ success: true });
 });
 
@@ -4164,24 +4170,35 @@ async function _checkTokenAlerts() {
         : parseFloat(p.volume?.h24 || 0);
       if (!(currentValue > 0)) continue;
 
-      const changePct = ((currentValue - a.baseline_value) / a.baseline_value) * 100;
-      const crossedUp = changePct >= a.threshold_pct;
-      const crossedDown = changePct <= -a.threshold_pct;
+      // Compare against the high/low watermark reached since the baseline was
+      // set, not just this instant's snapshot — otherwise a spike that
+      // crosses the threshold and reverts between two poll cycles (this job
+      // runs every 5 min) would never fire.
+      const highValue = Math.max(a.high_value ?? a.baseline_value, currentValue);
+      const lowValue = Math.min(a.low_value ?? a.baseline_value, currentValue);
+      const upPct = ((highValue - a.baseline_value) / a.baseline_value) * 100;
+      const downPct = ((lowValue - a.baseline_value) / a.baseline_value) * 100;
+      const crossedUp = upPct >= a.threshold_pct;
+      const crossedDown = downPct <= -a.threshold_pct;
       const shouldFire = (a.direction === 'up' && crossedUp) ||
                           (a.direction === 'down' && crossedDown) ||
                           (a.direction === 'both' && (crossedUp || crossedDown));
 
       if (shouldFire) {
-        const dir = changePct >= 0 ? 'up' : 'down';
+        // If both directions crossed (direction:'both'), report whichever
+        // moved further from baseline.
+        const dir = crossedUp && (!crossedDown || upPct >= Math.abs(downPct)) ? 'up' : 'down';
+        const changePct = dir === 'up' ? upPct : downPct;
+        const extremeValue = dir === 'up' ? highValue : lowValue;
         const label = a.metric === 'mcap' ? 'Market Cap' : 'Volume';
         const message = `${a.symbol || a.name || 'Token'} ${label} moved ${dir} ${Math.abs(changePct).toFixed(1)}% (threshold ${a.threshold_pct}%)`;
         await dbRun(`
           INSERT INTO alert_notifications (alert_id, wallet, address, chain, name, symbol, metric, direction, baseline_value, new_value, change_pct, message, ts)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        `, [a.id, a.wallet, a.address, a.chain, a.name, a.symbol, a.metric, dir, a.baseline_value, currentValue, changePct, message, Date.now()]);
+        `, [a.id, a.wallet, a.address, a.chain, a.name, a.symbol, a.metric, dir, a.baseline_value, extremeValue, changePct, message, Date.now()]);
         await dbRun('UPDATE token_alerts SET active=0, last_checked_at=? WHERE id=?', [Math.floor(Date.now() / 1000), a.id]);
       } else {
-        await dbRun('UPDATE token_alerts SET last_checked_at=? WHERE id=?', [Math.floor(Date.now() / 1000), a.id]);
+        await dbRun('UPDATE token_alerts SET high_value=?, low_value=?, last_checked_at=? WHERE id=?', [highValue, lowValue, Math.floor(Date.now() / 1000), a.id]);
       }
     } catch (e) {
       console.error('[alerts] check failed for', a.address, e.message);
