@@ -180,6 +180,17 @@ async function initDb() {
       is_read        TINYINT NOT NULL DEFAULT 0
     )
   `);
+  // Alerts categories beyond token movement (Bloombark broadcast updates,
+  // channel-mute notices) don't have a token address/metric/direction — relax
+  // those to nullable and add the category + title/subtitle/detail fields
+  // used for the collapsed-list / click-to-expand notification UI.
+  await pool.query(`ALTER TABLE alert_notifications MODIFY address VARCHAR(255) NULL`);
+  await pool.query(`ALTER TABLE alert_notifications MODIFY metric VARCHAR(16) NULL`);
+  await pool.query(`ALTER TABLE alert_notifications MODIFY direction VARCHAR(8) NULL`);
+  await _addCol("ALTER TABLE alert_notifications ADD COLUMN category VARCHAR(32) NOT NULL DEFAULT 'token_movement'");
+  await _addCol('ALTER TABLE alert_notifications ADD COLUMN title VARCHAR(255)');
+  await _addCol('ALTER TABLE alert_notifications ADD COLUMN subtitle VARCHAR(255)');
+  await _addCol('ALTER TABLE alert_notifications ADD COLUMN detail TEXT');
   // Community: paid-channel unlocks (one-time on-chain payment, verified then recorded here)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS channel_payments (
@@ -3531,6 +3542,15 @@ wss.on('connection', (ws) => {
            ON DUPLICATE KEY UPDATE muted_until=VALUES(muted_until), muted_by=VALUES(muted_by), reason=VALUES(reason)`,
           [targetWallet, mutedUntil, user.wallet, String(msg.reason || '').slice(0, 280) || null]
         );
+        await dbRun(`
+          INSERT INTO alert_notifications (wallet, category, title, subtitle, detail, ts)
+          VALUES (?,'muted',?,?,?,?)
+        `, [
+          targetWallet, 'You have been muted',
+          `Muted for ${minutes} minute${minutes === 1 ? '' : 's'} in Community chat`,
+          msg.reason ? `Reason: ${msg.reason}` : 'No reason was provided.',
+          Date.now(),
+        ]);
         ws.send(JSON.stringify({ type: 'chat_mute_ok', wallet: targetWallet, mutedUntil }));
         // Notify the muted user's live connection(s), if online, so their UI updates immediately.
         for (const [otherWs, otherUser] of chatUsers) {
@@ -4092,6 +4112,36 @@ app.get('/api/alerts/notifications', requireAuth, async (req, res) => {
 app.post('/api/alerts/notifications/mark-read', requireAuth, async (req, res) => {
   await dbRun('UPDATE alert_notifications SET is_read=1 WHERE wallet=?', [req.user.wallet]);
   res.json({ success: true });
+});
+
+app.post('/api/alerts/notifications/delete', requireAuth, async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Number.isFinite) : [];
+  if (!ids.length) return res.status(400).json({ error: 'ids required' });
+  await dbRun(`DELETE FROM alert_notifications WHERE wallet=? AND id IN (${ids.map(() => '?').join(',')})`, [req.user.wallet, ...ids]);
+  res.json({ success: true });
+});
+
+app.post('/api/alerts/notifications/delete-all', requireAuth, async (req, res) => {
+  await dbRun('DELETE FROM alert_notifications WHERE wallet=?', [req.user.wallet]);
+  res.json({ success: true });
+});
+
+// ── Admin: blast a Bloombark notification (Title/Subtitle/Desc) to every user ──
+app.post('/api/admin/alerts/blast', requireAuth, async (req, res) => {
+  if (!isAdminWallet(req.user.wallet)) return res.status(403).json({ error: 'Forbidden' });
+  const title = String(req.body?.title || '').trim().slice(0, 255);
+  const subtitle = String(req.body?.subtitle || '').trim().slice(0, 255);
+  const detail = String(req.body?.detail || '').trim().slice(0, 4000);
+  if (!title) return res.status(400).json({ error: 'title required' });
+  const users = await dbAll('SELECT wallet FROM users');
+  const ts = Date.now();
+  for (const { wallet } of users) {
+    await dbRun(`
+      INSERT INTO alert_notifications (wallet, category, title, subtitle, detail, ts)
+      VALUES (?,'bloombark_update',?,?,?,?)
+    `, [wallet, title, subtitle, detail, ts]);
+  }
+  res.json({ success: true, sent: users.length });
 });
 
 // Background checker: periodically compares each active alert's current MCAP/Volume
