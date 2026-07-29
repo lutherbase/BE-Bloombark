@@ -4227,6 +4227,20 @@ async function _checkTokenAlerts() {
 setTimeout(_checkTokenAlerts, 20000);
 setInterval(_checkTokenAlerts, 5 * 60 * 1000);
 
+// ─── Keep-alive: Render's free/starter tier spins the service down after
+// ~15 min with no inbound HTTP traffic. When that happens the whole Node
+// process pauses — including every setInterval-based background job above
+// (alert checker, BloomBuy poller, market/narrative warmers, etc), which
+// silently stops alerts from firing until the next real request wakes it
+// back up. Self-pinging our own public URL keeps genuine inbound traffic
+// flowing so Render never sees it as idle. ────────────────────────────────
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+if (process.env.RENDER_EXTERNAL_URL) {
+  setInterval(() => {
+    axios.get(`${process.env.RENDER_EXTERNAL_URL}/api/health`, { timeout: 10000 }).catch(() => {});
+  }, 10 * 60 * 1000);
+}
+
 // In-memory cache for wallet-map and solana trader data (5 min TTL)
 const _walletMapCache = new Map();
 function _wmc(key, val) {
