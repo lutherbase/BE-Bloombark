@@ -2693,6 +2693,11 @@ async function _fetchChainTransactions() {
       return [key, {
         transactionsToday: parseInt(data?.transactions_today || 0),
         totalTransactions: parseInt(data?.total_transactions || 0),
+        gasPriceGwei: data?.gas_prices ? {
+          slow: parseFloat(data.gas_prices.slow) || null,
+          average: parseFloat(data.gas_prices.average) || null,
+          fast: parseFloat(data.gas_prices.fast) || null,
+        } : null,
       }];
     } catch (e) {
       console.error(`[chain-tx] ${key} failed:`, e.message);
