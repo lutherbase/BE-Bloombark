@@ -144,6 +144,20 @@ async function initDb() {
     )
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS custom_holdings (
+      id         INT PRIMARY KEY AUTO_INCREMENT,
+      wallet     VARCHAR(255) NOT NULL,
+      address    VARCHAR(255) NOT NULL,
+      chain      VARCHAR(64) NOT NULL DEFAULT 'robinhood',
+      symbol     VARCHAR(64),
+      name       VARCHAR(255),
+      decimals   INT,
+      icon_url   TEXT,
+      added_at   INT DEFAULT (UNIX_TIMESTAMP()),
+      UNIQUE KEY uniq_wallet_address (wallet, address)
+    )
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS token_alerts (
       id              INT PRIMARY KEY AUTO_INCREMENT,
       wallet          VARCHAR(255) NOT NULL,
@@ -5058,10 +5072,78 @@ app.get('/api/trade/holdings/:wallet', async (req, res) => {
     } catch (_) {}
   }));
 
+  // Merge in manually-saved custom tokens (always Robinhood chain — see
+  // POST /api/trade/custom-tokens) that Blockscout's auto-detection above
+  // didn't already pick up, e.g. a token just bought that hasn't indexed
+  // yet, or one under the dust threshold. Shown even at 0 balance so saving
+  // one always makes it visible, same as adding it to MetaMask does.
+  try {
+    const custom = await dbAll('SELECT * FROM custom_holdings WHERE wallet=?', [wallet.toLowerCase()]);
+    const existingAddrs = new Set(holdings.filter(h => h.address).map(h => h.address.toLowerCase()));
+    for (const c of custom) {
+      if (existingAddrs.has(c.address.toLowerCase())) continue;
+      let bal = 0, usd = null;
+      try {
+        bal = await _erc20BalanceOf(RPC_URLS[c.chain], c.address, wallet);
+        const dsRes = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${c.address}`, { timeout: 8000 }).catch(() => null);
+        const pairs = (dsRes?.data?.pairs || []).filter(p => p.chainId === c.chain);
+        if (pairs.length) {
+          const price = parseFloat(pairs[0].priceUsd || 0);
+          usd = price ? bal * price : null;
+        }
+      } catch (_) {}
+      holdings.push({ chain: c.chain, address: c.address, symbol: c.symbol, name: c.name, balance: bal, usd, icon: c.icon_url, native: false, decimals: c.decimals, isCustom: true });
+    }
+  } catch (_) {}
+
   holdings.sort((a, b) => (b.usd || 0) - (a.usd || 0));
   const top = holdings.slice(0, CONFIG.holdingsMaxResults);
   _holdingsCache.set(wallet.toLowerCase(), { ts: Date.now(), data: top });
   res.json({ holdings: top });
+});
+
+// Manually-saved tokens for the Holdings list (chain hardcoded to Robinhood
+// server-side, never client-controlled) — for a token the user wants
+// tracked even before/without Blockscout auto-detecting a balance for it.
+// Saving also feeds the frontend's "Import to MetaMask" (wallet_watchAsset)
+// call with the resolved symbol/decimals/icon.
+app.post('/api/trade/custom-tokens', express.json({ limit: '10kb' }), async (req, res) => {
+  const { wallet, address } = req.body || {};
+  if (!wallet || !/^0x[0-9a-fA-F]{40}$/.test(wallet)) return res.status(400).json({ error: 'invalid wallet' });
+  if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address)) return res.status(400).json({ error: 'invalid token address' });
+  const chain = 'robinhood';
+  const walletLower = wallet.toLowerCase();
+  const addrLower = address.toLowerCase();
+  try {
+    const dsRes = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${addrLower}`, { timeout: 8000 });
+    const pairs = (dsRes.data?.pairs || []).filter(p => p.chainId === chain)
+      .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+    if (!pairs.length) return res.status(400).json({ error: 'Token not found on Robinhood chain' });
+    const p = pairs[0];
+    const symbol = p.baseToken?.symbol || '?';
+    const name   = p.baseToken?.name || '';
+    const icon   = p.info?.imageUrl || null;
+
+    const decHex = await _ethCall(RPC_URLS[chain], addrLower, '0x313ce567');
+    const decimals = decHex && decHex !== '0x' ? parseInt(decHex, 16) : 18;
+
+    await dbRun(`
+      INSERT INTO custom_holdings (wallet, address, chain, symbol, name, decimals, icon_url)
+      VALUES (?,?,?,?,?,?,?)
+      ON DUPLICATE KEY UPDATE symbol=VALUES(symbol), name=VALUES(name), decimals=VALUES(decimals), icon_url=VALUES(icon_url)
+    `, [walletLower, addrLower, chain, symbol, name, decimals, icon]);
+    _holdingsCache.delete(walletLower); // force a fresh merge on next holdings fetch
+
+    res.json({ success: true, token: { address: addrLower, chain, symbol, name, decimals, icon } });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+app.delete('/api/trade/custom-tokens/:wallet/:address', async (req, res) => {
+  await dbRun('DELETE FROM custom_holdings WHERE wallet=? AND address=?', [req.params.wallet.toLowerCase(), req.params.address.toLowerCase()]);
+  _holdingsCache.delete(req.params.wallet.toLowerCase());
+  res.json({ success: true });
 });
 
 // ─── Legacy trading proxy (0x, EVM-only backup) ─────────────────────────────
