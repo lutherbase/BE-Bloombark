@@ -5043,7 +5043,7 @@ app.get('/api/trade/holdings/:wallet', async (req, res) => {
         const usd = tok.exchange_rate ? bal * parseFloat(tok.exchange_rate) : null;
         if (bal <= 0) continue;
         if (usd !== null && usd < CONFIG.holdingsDustUsd) continue; // dust
-        holdings.push({ chain, address: tok.address_hash || tok.address, symbol: tok.symbol || '?', name: tok.name || '', balance: bal, usd, icon: tok.icon_url || null, native: false });
+        holdings.push({ chain, address: tok.address_hash || tok.address, symbol: tok.symbol || '?', name: tok.name || '', balance: bal, usd, icon: tok.icon_url || null, native: false, decimals: parseInt(tok.decimals) });
       }
     } catch (_) {}
     // Native balance + price
