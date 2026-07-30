@@ -1993,10 +1993,34 @@ function resampleCandles(candles5m, intervalSecs) {
 }
 
 // ─── Recent Trades endpoint ─────────────────────────────────────────────────────
+// Short-lived cache, keyed by pool+network+limit — the frontend polls this
+// every 12s per open Trade page, and multiple users/tabs often watch the
+// same pool at once. Collapsing those onto one upstream GeckoTerminal call
+// per ~8s cuts real request volume without needing a different data source
+// (checked — DexScreener's equivalent trade feed is Cloudflare-protected/
+// undocumented and RPC-based swap-log decoding is a much bigger lift for
+// the same result GeckoTerminal already gives us).
+const RECENT_TRADES_TTL = 8000;
+const _recentTradesCache = new Map(); // key -> { data, at }
+// Sweep stale entries periodically so this doesn't grow unbounded over the
+// app's lifetime as more distinct pools get looked up.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of _recentTradesCache) {
+    if (now - entry.at > RECENT_TRADES_TTL) _recentTradesCache.delete(key);
+  }
+}, 60000);
+
 app.post('/api/recent-trades', async (req, res) => {
   try {
     const { poolAddress, network = 'eth', limit: reqLimit } = req.body;
     if (!poolAddress) return res.json({ success: false, trades: [] });
+
+    const cacheKey = `${network}:${poolAddress.toLowerCase()}:${reqLimit || 30}`;
+    const cached = _recentTradesCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < RECENT_TRADES_TTL) {
+      return res.json(cached.data);
+    }
 
     const limit = Math.min(Math.max(parseInt(reqLimit) || 30, 1), 300);
     const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/trades?limit=${limit}`;
@@ -2036,7 +2060,9 @@ app.post('/api/recent-trades', async (req, res) => {
       };
     });
 
-    res.json({ success: true, trades });
+    const payload = { success: true, trades };
+    _recentTradesCache.set(cacheKey, { data: payload, at: Date.now() });
+    res.json(payload);
   } catch (e) {
     res.json({ success: false, trades: [], error: e.message });
   }
