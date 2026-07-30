@@ -2018,8 +2018,12 @@ function resampleCandles(candles5m, intervalSecs) {
 // same pool at once. Collapsing those onto one upstream GeckoTerminal call
 // per ~8s cuts real request volume without needing a different data source
 // (checked — DexScreener's equivalent trade feed is Cloudflare-protected/
-// undocumented and RPC-based swap-log decoding is a much bigger lift for
-// the same result GeckoTerminal already gives us).
+// undocumented). When GeckoTerminal has no data at all for a pool (e.g. it
+// doesn't index the pool's DEX/launchpad — confirmed happening for pools on
+// Robinhood chain's "Flap" launchpad, which return a plain 404), we fall
+// back to reading Uniswap-V2-style Swap events directly from the chain via
+// Blockscout's already-decoded logs endpoint + a couple of RPC eth_calls for
+// token0/token1 ordering and decimals — see _fetchOnchainSwaps below.
 const RECENT_TRADES_TTL = 8000;
 const _recentTradesCache = new Map(); // key -> { data, at }
 // Sweep stale entries periodically so this doesn't grow unbounded over the
@@ -2031,9 +2035,101 @@ setInterval(() => {
   }
 }, 60000);
 
+function _tsToAgoStr(tsMs, nowMs) {
+  const agoMs = nowMs - tsMs;
+  return agoMs < 60000 ? `${Math.floor(agoMs/1000)}s ago`
+    : agoMs < 3600000 ? `${Math.floor(agoMs/60000)}m ago`
+    : `${Math.floor(agoMs/3600000)}h ago`;
+}
+
+// Uniswap-V2-style pair function selectors (token0/token1/decimals) — used
+// only for the on-chain fallback path.
+const _V2_TOKEN0_SEL  = '0x0dfe1681';
+const _V2_TOKEN1_SEL  = '0xd21220a7';
+const _ERC20_DEC_SEL  = '0x313ce567';
+
+// Fallback for pools GeckoTerminal doesn't index at all (404/empty) — reads
+// Swap events straight from the chain via Blockscout's decoded logs, using
+// DexScreener (which does index it — confirmed for Robinhood chain's Flap
+// launchpad pools) purely to learn which side is base/quote and get a
+// current quote-token USD rate. That current rate is applied to every swap
+// in the batch rather than each swap's own historical rate, which is a fine
+// approximation for a short list of genuinely recent trades but would drift
+// for anything older.
+async function _fetchOnchainSwaps(chain, poolAddress, limit) {
+  const rpcUrl = RPC_URLS[chain];
+  const blockscoutBase = BLOCKSCOUT_URLS[chain];
+  if (!rpcUrl || !blockscoutBase) return [];
+
+  const dsRes = await axios.get(`${DEXSCREENER}/latest/dex/pairs/${chain}/${poolAddress}`, { timeout: 8000 }).catch(() => null);
+  const pair = dsRes?.data?.pairs?.[0];
+  if (!pair) return [];
+  const baseAddr = (pair.baseToken?.address || '').toLowerCase();
+  const priceNative = parseFloat(pair.priceNative || 0);
+  const quoteUsdPrice = priceNative > 0 ? parseFloat(pair.priceUsd || 0) / priceNative : 0;
+  if (!baseAddr || !quoteUsdPrice) return [];
+
+  const [token0Hex, token1Hex] = await Promise.all([
+    _ethCall(rpcUrl, poolAddress, _V2_TOKEN0_SEL),
+    _ethCall(rpcUrl, poolAddress, _V2_TOKEN1_SEL),
+  ]);
+  if (!token0Hex || token0Hex === '0x' || !token1Hex || token1Hex === '0x') return [];
+  const token0 = '0x' + token0Hex.slice(-40);
+  const token1 = '0x' + token1Hex.slice(-40);
+  const baseIsToken0 = token0.toLowerCase() === baseAddr;
+  if (!baseIsToken0 && token1.toLowerCase() !== baseAddr) return []; // pool doesn't actually hold this token — bail
+
+  const [dec0Hex, dec1Hex] = await Promise.all([
+    _ethCall(rpcUrl, token0, _ERC20_DEC_SEL),
+    _ethCall(rpcUrl, token1, _ERC20_DEC_SEL),
+  ]);
+  const dec0 = dec0Hex && dec0Hex !== '0x' ? parseInt(dec0Hex, 16) : 18;
+  const dec1 = dec1Hex && dec1Hex !== '0x' ? parseInt(dec1Hex, 16) : 18;
+  const baseDecimals  = baseIsToken0 ? dec0 : dec1;
+  const quoteDecimals = baseIsToken0 ? dec1 : dec0;
+
+  const logsRes = await axios.get(`${blockscoutBase}/api/v2/addresses/${poolAddress}/logs?items_count=${Math.min(limit, 50)}`, { timeout: 10000 }).catch(() => null);
+  const logs = (logsRes?.data?.items || []).filter(l => l.decoded?.method_call?.startsWith('Swap('));
+  const nowMs = Date.now();
+
+  return logs.map(log => {
+    try {
+      const p = Object.fromEntries((log.decoded.parameters || []).map(x => [x.name, x.value]));
+      if (p.amount0In === undefined) return null; // not a V2-shaped Swap — skip rather than guess
+      const amount0In  = BigInt(p.amount0In  || 0), amount1In  = BigInt(p.amount1In  || 0);
+      const amount0Out = BigInt(p.amount0Out || 0), amount1Out = BigInt(p.amount1Out || 0);
+      const baseOut  = baseIsToken0 ? amount0Out : amount1Out;
+      const baseIn   = baseIsToken0 ? amount0In  : amount1In;
+      const quoteIn  = baseIsToken0 ? amount1In  : amount0In;
+      const quoteOut = baseIsToken0 ? amount1Out : amount0Out;
+      const isBuy = baseOut > 0n;
+      const baseAmountRaw  = isBuy ? baseOut : baseIn;
+      const quoteAmountRaw = isBuy ? quoteIn : quoteOut;
+      const amount = Number(baseAmountRaw) / Math.pow(10, baseDecimals);
+      const quoteAmount = Number(quoteAmountRaw) / Math.pow(10, quoteDecimals);
+      const volUsd = quoteAmount * quoteUsdPrice;
+      if (!(amount > 0)) return null;
+      const tsMs = log.block_timestamp ? new Date(log.block_timestamp).getTime() : nowMs;
+      const wallet = p.to || p.sender || '';
+      return {
+        type: isBuy ? 'Buy' : 'Sell',
+        isBuy,
+        volUsd,
+        priceUsd: volUsd / amount,
+        amount,
+        wallet: wallet ? shortAddr(wallet) : '—',
+        walletFull: wallet,
+        txHash: log.transaction_hash || '',
+        time: _tsToAgoStr(tsMs, nowMs),
+        timestamp: tsMs,
+      };
+    } catch (e) { return null; }
+  }).filter(Boolean).sort((a, b) => b.timestamp - a.timestamp);
+}
+
 app.post('/api/recent-trades', async (req, res) => {
   try {
-    const { poolAddress, network = 'eth', limit: reqLimit } = req.body;
+    const { poolAddress, network = 'eth', chain, limit: reqLimit } = req.body;
     if (!poolAddress) return res.json({ success: false, trades: [] });
 
     const cacheKey = `${network}:${poolAddress.toLowerCase()}:${reqLimit || 30}`;
@@ -2043,42 +2139,48 @@ app.post('/api/recent-trades', async (req, res) => {
     }
 
     const limit = Math.min(Math.max(parseInt(reqLimit) || 30, 1), 300);
-    const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/trades?limit=${limit}`;
-    const { data } = await _geckoGetWithRetry(url, { timeout: 10000, headers: GECKO_HEADS });
-    const raw = data?.data || [];
-    const nowMs = Date.now();
+    let trades = [];
+    try {
+      const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/trades?limit=${limit}`;
+      const { data } = await _geckoGetWithRetry(url, { timeout: 10000, headers: GECKO_HEADS });
+      const raw = data?.data || [];
+      const nowMs = Date.now();
 
-    const trades = raw.slice(0, limit).map(t => {
-      const a       = t.attributes;
-      const tsMs    = a.block_timestamp ? new Date(a.block_timestamp).getTime() : nowMs;
-      const agoMs   = nowMs - tsMs;
-      const agoStr  = agoMs < 60000 ? `${Math.floor(agoMs/1000)}s ago`
-        : agoMs < 3600000 ? `${Math.floor(agoMs/60000)}m ago`
-        : `${Math.floor(agoMs/3600000)}h ago`;
-      const vol     = parseFloat(a.volume_in_usd || 0);
-      const addr    = a.tx_from_address || '';
-      // Execution price of the BASE token at trade time:
-      // buy → base token is the "to" side; sell → base token is the "from" side
-      const priceUsd = parseFloat(
-        (a.kind === 'buy' ? a.price_to_in_usd : a.price_from_in_usd) || 0
-      );
-      // Base token amount traded
-      const amount = parseFloat(
-        (a.kind === 'buy' ? a.to_token_amount : a.from_token_amount) || 0
-      );
-      return {
-        type:      a.kind === 'buy' ? 'Buy' : 'Sell',
-        isBuy:     a.kind === 'buy',
-        volUsd:    vol,
-        priceUsd,
-        amount,
-        wallet:    addr ? shortAddr(addr) : '—',
-        walletFull: addr,
-        txHash:    a.tx_hash || '',
-        time:      agoStr,
-        timestamp: tsMs,
-      };
-    });
+      trades = raw.slice(0, limit).map(t => {
+        const a       = t.attributes;
+        const tsMs    = a.block_timestamp ? new Date(a.block_timestamp).getTime() : nowMs;
+        const vol     = parseFloat(a.volume_in_usd || 0);
+        const addr    = a.tx_from_address || '';
+        // Execution price of the BASE token at trade time:
+        // buy → base token is the "to" side; sell → base token is the "from" side
+        const priceUsd = parseFloat(
+          (a.kind === 'buy' ? a.price_to_in_usd : a.price_from_in_usd) || 0
+        );
+        // Base token amount traded
+        const amount = parseFloat(
+          (a.kind === 'buy' ? a.to_token_amount : a.from_token_amount) || 0
+        );
+        return {
+          type:      a.kind === 'buy' ? 'Buy' : 'Sell',
+          isBuy:     a.kind === 'buy',
+          volUsd:    vol,
+          priceUsd,
+          amount,
+          wallet:    addr ? shortAddr(addr) : '—',
+          walletFull: addr,
+          txHash:    a.tx_hash || '',
+          time:      _tsToAgoStr(tsMs, nowMs),
+          timestamp: tsMs,
+        };
+      });
+    } catch (e) {
+      trades = []; // 404/other — fall through to on-chain fallback below
+    }
+
+    if (!trades.length && chain) {
+      try { trades = await _fetchOnchainSwaps(chain, poolAddress, limit); }
+      catch (e) { console.error('[recent-trades] onchain fallback failed:', e.message); }
+    }
 
     const payload = { success: true, trades };
     _recentTradesCache.set(cacheKey, { data: payload, at: Date.now() });
