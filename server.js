@@ -320,6 +320,26 @@ const GOPLUS       = process.env.GOPLUS_API || 'https://api.gopluslabs.io/api/v1
 const GOPLUS_API_KEY = process.env.GOPLUS_API_KEY || '';
 const GOPLUS_HEADS = GOPLUS_API_KEY ? { 'Authorization': GOPLUS_API_KEY } : {};
 
+// Without GECKO_API_KEY (unset by default — see GECKO_HEADS above), GeckoTerminal's
+// free-tier rate limit is tight and shared across every feature that calls it
+// (Trade page chart/recent-trades, Market Overview tabs, Narrative). A 429 during
+// a burst of traffic previously failed silently with no retry. This wraps any
+// GeckoTerminal GET with a couple of short backoff retries specifically for 429s,
+// so a single rate-limit hit doesn't fail a request outright.
+async function _geckoGetWithRetry(url, opts = {}, maxRetries = 2) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await axios.get(url, opts);
+    } catch (e) {
+      if (e.response?.status === 429 && attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt))); // 500ms, 1000ms
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 // ─── Tunable parameters (all env-overridable; defaults preserve current behavior) ──
 const CONFIG = {
   // Caching / TTLs (ms unless noted)
@@ -2024,7 +2044,7 @@ app.post('/api/recent-trades', async (req, res) => {
 
     const limit = Math.min(Math.max(parseInt(reqLimit) || 30, 1), 300);
     const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/trades?limit=${limit}`;
-    const { data } = await axios.get(url, { timeout: 10000, headers: GECKO_HEADS });
+    const { data } = await _geckoGetWithRetry(url, { timeout: 10000, headers: GECKO_HEADS });
     const raw = data?.data || [];
     const nowMs = Date.now();
 
