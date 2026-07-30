@@ -2048,6 +2048,58 @@ const _V2_TOKEN0_SEL  = '0x0dfe1681';
 const _V2_TOKEN1_SEL  = '0xd21220a7';
 const _ERC20_DEC_SEL  = '0x313ce567';
 
+async function _ethCallWithRetry(rpcUrl, to, data, maxRetries = 1) {
+  for (let attempt = 0; ; attempt++) {
+    const r = await axios.post(rpcUrl,
+      { jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to, data }, 'latest'] },
+      { timeout: 8000, headers: { 'Content-Type': 'application/json' } }
+    ).catch(e => ({ __err: e }));
+    if (!r.__err) return r.data?.result || '0x';
+    if (r.__err.response?.status === 429 && attempt < maxRetries) {
+      await new Promise(res => setTimeout(res, 800 * (attempt + 1)));
+      continue;
+    }
+    return '0x';
+  }
+}
+
+// token0/token1 ordering and decimals are immutable properties of a pool —
+// once known they're cached forever, so a pool only ever pays the RPC cost
+// on its very first lookup instead of on every 12s poll. This matters a lot
+// on chains whose "RPC" is actually their block explorer proxy (Robinhood
+// chain), which rate-limits a burst of eth_calls readily.
+const _poolMetaCache = new Map(); // `${chain}:${pool}` -> { baseIsToken0, baseDecimals, quoteDecimals } | null (negative-cached)
+
+async function _getPoolMeta(chain, rpcUrl, poolAddress, baseAddr) {
+  const key = `${chain}:${poolAddress.toLowerCase()}`;
+  if (_poolMetaCache.has(key)) return _poolMetaCache.get(key);
+
+  // Sequential, spaced out — a burst of concurrent calls trips the shared
+  // rate limit much more readily than the same calls a beat apart.
+  const token0Hex = await _ethCallWithRetry(rpcUrl, poolAddress, _V2_TOKEN0_SEL);
+  await new Promise(r => setTimeout(r, 300));
+  const token1Hex = await _ethCallWithRetry(rpcUrl, poolAddress, _V2_TOKEN1_SEL);
+  if (!token0Hex || token0Hex === '0x' || !token1Hex || token1Hex === '0x') return null; // not cached — genuinely transient, worth retrying next poll
+  const token0 = '0x' + token0Hex.slice(-40);
+  const token1 = '0x' + token1Hex.slice(-40);
+  const baseIsToken0 = token0.toLowerCase() === baseAddr;
+  if (!baseIsToken0 && token1.toLowerCase() !== baseAddr) {
+    _poolMetaCache.set(key, null); // genuinely not a V2 pair holding this token — no point retrying
+    return null;
+  }
+
+  await new Promise(r => setTimeout(r, 300));
+  const dec0Hex = await _ethCallWithRetry(rpcUrl, token0, _ERC20_DEC_SEL);
+  await new Promise(r => setTimeout(r, 300));
+  const dec1Hex = await _ethCallWithRetry(rpcUrl, token1, _ERC20_DEC_SEL);
+  const dec0 = dec0Hex && dec0Hex !== '0x' ? parseInt(dec0Hex, 16) : 18;
+  const dec1 = dec1Hex && dec1Hex !== '0x' ? parseInt(dec1Hex, 16) : 18;
+
+  const meta = { baseIsToken0, baseDecimals: baseIsToken0 ? dec0 : dec1, quoteDecimals: baseIsToken0 ? dec1 : dec0 };
+  _poolMetaCache.set(key, meta);
+  return meta;
+}
+
 // Fallback for pools GeckoTerminal doesn't index at all (404/empty) — reads
 // Swap events straight from the chain via Blockscout's decoded logs, using
 // DexScreener (which does index it — confirmed for Robinhood chain's Flap
@@ -2069,24 +2121,9 @@ async function _fetchOnchainSwaps(chain, poolAddress, limit) {
   const quoteUsdPrice = priceNative > 0 ? parseFloat(pair.priceUsd || 0) / priceNative : 0;
   if (!baseAddr || !quoteUsdPrice) return [];
 
-  const [token0Hex, token1Hex] = await Promise.all([
-    _ethCall(rpcUrl, poolAddress, _V2_TOKEN0_SEL),
-    _ethCall(rpcUrl, poolAddress, _V2_TOKEN1_SEL),
-  ]);
-  if (!token0Hex || token0Hex === '0x' || !token1Hex || token1Hex === '0x') return [];
-  const token0 = '0x' + token0Hex.slice(-40);
-  const token1 = '0x' + token1Hex.slice(-40);
-  const baseIsToken0 = token0.toLowerCase() === baseAddr;
-  if (!baseIsToken0 && token1.toLowerCase() !== baseAddr) return []; // pool doesn't actually hold this token — bail
-
-  const [dec0Hex, dec1Hex] = await Promise.all([
-    _ethCall(rpcUrl, token0, _ERC20_DEC_SEL),
-    _ethCall(rpcUrl, token1, _ERC20_DEC_SEL),
-  ]);
-  const dec0 = dec0Hex && dec0Hex !== '0x' ? parseInt(dec0Hex, 16) : 18;
-  const dec1 = dec1Hex && dec1Hex !== '0x' ? parseInt(dec1Hex, 16) : 18;
-  const baseDecimals  = baseIsToken0 ? dec0 : dec1;
-  const quoteDecimals = baseIsToken0 ? dec1 : dec0;
+  const meta = await _getPoolMeta(chain, rpcUrl, poolAddress, baseAddr);
+  if (!meta) return [];
+  const { baseIsToken0, baseDecimals, quoteDecimals } = meta;
 
   const logsRes = await axios.get(`${blockscoutBase}/api/v2/addresses/${poolAddress}/logs?items_count=${Math.min(limit, 50)}`, { timeout: 10000 }).catch(() => null);
   const logs = (logsRes?.data?.items || []).filter(l => l.decoded?.method_call?.startsWith('Swap('));
@@ -2984,10 +3021,20 @@ const CHANNEL_GATES = {
 const _gateCache = new Map(); // `${room}:${wallet}` -> { val, ts }
 
 async function _ethCall(rpcUrl, to, data) {
-  const r = await axios.post(rpcUrl,
-    { jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to, data }, 'latest'] },
-    { timeout: 8000, headers: { 'Content-Type': 'application/json' } });
-  return r.data?.result || '0x';
+  // Some chains' "RPC" is actually proxied through their block explorer (e.g.
+  // Robinhood chain's rpc IS robinhoodchain.blockscout.com) and shares that
+  // explorer's own rate limit — a burst of calls trips a 429 easily. Treat
+  // any failure the same as "no data" (both existing callers already handle
+  // a falsy/'0x' result gracefully) rather than throwing and killing whatever
+  // Promise.all it's part of.
+  try {
+    const r = await axios.post(rpcUrl,
+      { jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to, data }, 'latest'] },
+      { timeout: 8000, headers: { 'Content-Type': 'application/json' } });
+    return r.data?.result || '0x';
+  } catch (e) {
+    return '0x';
+  }
 }
 
 async function _nativeBalanceOnChain(rpcUrl, wallet) {
