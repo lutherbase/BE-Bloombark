@@ -5120,8 +5120,26 @@ app.post('/api/trade/rpc/:chain', express.json({ limit: '100kb' }), async (req, 
   try {
     const url = RPC_URLS[req.params.chain];
     if (!url) return res.status(400).json({ error: 'unsupported chain' });
-    const r = await axios.post(url, req.body, { timeout: 10000 });
-    res.json(r.data);
+    // Same 429 as _ethCallWithRetry deals with elsewhere — chains whose "RPC"
+    // is really their block explorer proxy (Robinhood chain) rate-limit
+    // readily, and this generic proxy (decimals/balance/allowance reads
+    // across Trade, Limit Order, Holdings) previously had zero resilience to
+    // that, unlike the on-chain-swaps fallback path.
+    let lastErr;
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      try {
+        const r = await axios.post(url, req.body, { timeout: 10000 });
+        return res.json(r.data);
+      } catch (e) {
+        lastErr = e;
+        if (e.response?.status === 429 && attempt < 1) {
+          await new Promise(r => setTimeout(r, 800));
+          continue;
+        }
+        break;
+      }
+    }
+    res.status(502).json({ error: lastErr.message });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
