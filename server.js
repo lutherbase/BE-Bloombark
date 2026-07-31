@@ -4039,10 +4039,14 @@ app.post('/api/predict', async (req, res) => {
   if (!address) return res.json({ success: false, error: 'Address required' });
 
   try {
-    // Fetch token data from DexScreener
+    // Fetch token data from DexScreener — pick the pair the same way every
+    // other endpoint does (filter to the requested chain, highest liquidity),
+    // so this scores the exact pair the caller is looking at instead of
+    // possibly a different pair/chain with more 24h volume.
     const dsRes = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${address}`, { timeout: 8000 }).catch(() => null);
-    const pairs  = dsRes?.data?.pairs || [];
-    const pair   = pairs.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0))[0];
+    const allPairs = dsRes?.data?.pairs || [];
+    const pairs  = chain ? allPairs.filter(p => p.chainId === chain) : allPairs;
+    const pair   = (pairs.length ? pairs : allPairs).sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
 
     if (!pair) return res.json({ success: false, error: 'Token not found on DexScreener' });
 
