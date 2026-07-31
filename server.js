@@ -754,7 +754,7 @@ async function fetchDexScreener(contractAddress, chainId = 'ethereum') {
     pairCreatedAt: p.pairCreatedAt || null,
     imageUrl:    p.info?.imageUrl  || null,
     headerUrl:   p.info?.header    || null,
-    websites:    (p.info?.websites || []).map(w => w.url || w),
+    websites:    (p.info?.websites || []).map(w => ({ url: w.url || w, label: w.label || null })),
     socials:     p.info?.socials   || [],
     labels:      p.labels          || [],
     allPairs:    bestPairs.length,
@@ -1699,8 +1699,21 @@ app.post('/api/analyze', async (req, res) => {
     const realHolderCount = geckoInfo?.holders || holderResult?.holders?.length || null;
     const gtHolderDist    = geckoInfo?.holderDist || null;
 
-    // Websites / socials: merge both sources
-    const websites = [...new Set([...(dex?.websites||[]), ...(geckoInfo?.websites||[])])].filter(Boolean);
+    // Websites / socials: merge both sources, deduped by URL, preserving each
+    // site's own label (e.g. "Website" vs "Docs") — previously flattened to
+    // bare URL strings, which made every link render as a generic "Web" with
+    // no way to tell multiple links apart.
+    const _websiteMap = new Map(); // url -> label
+    for (const w of (dex?.websites || [])) {
+      const url = typeof w === 'string' ? w : w?.url;
+      if (url) _websiteMap.set(url, (typeof w === 'object' && w?.label) || _websiteMap.get(url) || null);
+    }
+    for (const w of (geckoInfo?.websites || [])) {
+      const url = typeof w === 'string' ? w : w?.url;
+      const label = typeof w === 'object' ? w?.label : null;
+      if (url && !_websiteMap.has(url)) _websiteMap.set(url, label || null);
+    }
+    const websites = [..._websiteMap.entries()].map(([url, label]) => ({ url, label }));
     const socials  = dex?.socials || [];
 
     // DEX id & pair address
