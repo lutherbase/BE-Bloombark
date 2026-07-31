@@ -273,6 +273,7 @@ async function initDb() {
       KEY idx_predicted_at (predicted_at)
     )
   `);
+  await _addCol('ALTER TABLE prediction_history ADD COLUMN image_url VARCHAR(500)');
   // Community: paid-channel unlocks (one-time on-chain payment, verified then recorded here)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS channel_payments (
@@ -4242,10 +4243,10 @@ app.post('/api/predict', async (req, res) => {
     // skips NEUTRAL (no clear right/wrong to resolve against later).
     if (verdict === 'BULLISH' || verdict === 'BEARISH') {
       dbRun(`
-        INSERT INTO prediction_history (address, chain, symbol, name, signal, confidence, price_at, predicted_at)
-        VALUES (?,?,?,?,?,?,?,?)
+        INSERT INTO prediction_history (address, chain, symbol, name, signal, confidence, price_at, predicted_at, image_url)
+        VALUES (?,?,?,?,?,?,?,?,?)
       `, [address.toLowerCase(), chain || pair.chainId, pair.baseToken?.symbol, pair.baseToken?.name,
-          verdict, confidence, parseFloat(pair.priceUsd || 0), Date.now()]).catch(e => console.error('[track-record] log failed:', e.message));
+          verdict, confidence, parseFloat(pair.priceUsd || 0), Date.now(), pair.info?.imageUrl || null]).catch(e => console.error('[track-record] log failed:', e.message));
     }
 
   } catch (e) {
@@ -4668,6 +4669,17 @@ app.get('/api/predict/track-record', async (req, res) => {
     const winRatePct = decisive.length ? Math.round((correct / decisive.length) * 1000) / 10 : null;
     const pending = await dbGet('SELECT COUNT(*) AS c FROM prediction_history WHERE resolved_at IS NULL');
 
+    // Distinct tokens ever covered (ticker + CA + image only — a quick
+    // "which tokens has the AI actually called" reference list, separate
+    // from the win/loss detail rows above).
+    const tokenRows = await dbAll(`
+      SELECT address, chain, symbol, name, image_url, MAX(predicted_at) AS last_predicted_at
+      FROM prediction_history
+      GROUP BY address, chain
+      ORDER BY last_predicted_at DESC
+      LIMIT 100
+    `);
+
     res.json({
       success: true,
       totalResolved: decisive.length,
@@ -4678,6 +4690,9 @@ app.get('/api/predict/track-record', async (req, res) => {
         symbol: r.symbol, name: r.name, chain: r.chain, signal: r.signal, confidence: r.confidence,
         priceAt: r.price_at, priceAfter: r.price_after, changePct: r.change_pct, outcome: r.outcome,
         predictedAt: r.predicted_at, resolvedAt: r.resolved_at,
+      })),
+      tokens: tokenRows.map(t => ({
+        address: t.address, chain: t.chain, symbol: t.symbol, name: t.name, imageUrl: t.image_url,
       })),
     });
   } catch (e) {
