@@ -317,6 +317,22 @@ const CHAIN_NETWORKS = {
   },
 };
 
+// Blockscout Pro API key (optional) — Robinhood chain's default RPC/REST is
+// proxied through Blockscout's own free instance, which enforces a very
+// tight 3 req/min rate limit without a key (confirmed hitting this in
+// practice — even a single pending-tx confirmation poll blows past it). When
+// BLOCKSCOUT_API_KEY is set, route Robinhood-chain RPC + REST calls through
+// Blockscout's Pro API gateway instead (same data/shape, ~600 req/min).
+// Explorer links shown to users are untouched — only the API-consuming host
+// changes. Testnet is left alone; it isn't Blockscout-proxied.
+const BLOCKSCOUT_API_KEY = process.env.BLOCKSCOUT_API_KEY || '';
+const BLOCKSCOUT_AUTH_HEADERS = BLOCKSCOUT_API_KEY ? { Authorization: `Bearer ${BLOCKSCOUT_API_KEY}` } : {};
+if (BLOCKSCOUT_API_KEY) {
+  const rh = CHAIN_NETWORKS.robinhood.mainnet;
+  rh.rpc = `https://api.blockscout.com/${rh.chainId}/json-rpc`;
+  rh.blockscout = `https://api.blockscout.com/${rh.chainId}/api/v2`;
+}
+
 // Returns the active (testnet or mainnet, per NETWORK_ENV) config for a chain key
 function chainCfg(key) {
   const c = CHAIN_NETWORKS[key];
@@ -2066,7 +2082,7 @@ async function _ethCallWithRetry(rpcUrl, to, data, maxRetries = 1) {
   for (let attempt = 0; ; attempt++) {
     const r = await axios.post(rpcUrl,
       { jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to, data }, 'latest'] },
-      { timeout: 8000, headers: { 'Content-Type': 'application/json' } }
+      { timeout: 8000, headers: { 'Content-Type': 'application/json', ...BLOCKSCOUT_AUTH_HEADERS } }
     ).catch(e => ({ __err: e }));
     if (!r.__err) return r.data?.result || '0x';
     if (r.__err.response?.status === 429 && attempt < maxRetries) {
@@ -2139,7 +2155,7 @@ async function _fetchOnchainSwaps(chain, poolAddress, limit) {
   if (!meta) return [];
   const { baseIsToken0, baseDecimals, quoteDecimals } = meta;
 
-  const logsRes = await axios.get(`${blockscoutBase}/api/v2/addresses/${poolAddress}/logs?items_count=${Math.min(limit, 50)}`, { timeout: 10000 }).catch(() => null);
+  const logsRes = await axios.get(`${blockscoutBase}/api/v2/addresses/${poolAddress}/logs?items_count=${Math.min(limit, 50)}`, { timeout: 10000, headers: BLOCKSCOUT_AUTH_HEADERS }).catch(() => null);
   const logs = (logsRes?.data?.items || []).filter(l => l.decoded?.method_call?.startsWith('Swap('));
   const nowMs = Date.now();
 
@@ -2888,7 +2904,7 @@ async function _fetchChainTransactions() {
     try {
       const base = chainCfg(key).blockscout;
       if (!base) return [key, null];
-      const { data } = await axios.get(`${base}/api/v2/stats`, { timeout: 10000 });
+      const { data } = await axios.get(`${base}/api/v2/stats`, { timeout: 10000, headers: BLOCKSCOUT_AUTH_HEADERS });
       return [key, {
         transactionsToday: parseInt(data?.transactions_today || 0),
         totalTransactions: parseInt(data?.total_transactions || 0),
@@ -3044,7 +3060,7 @@ async function _ethCall(rpcUrl, to, data) {
   try {
     const r = await axios.post(rpcUrl,
       { jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to, data }, 'latest'] },
-      { timeout: 8000, headers: { 'Content-Type': 'application/json' } });
+      { timeout: 8000, headers: { 'Content-Type': 'application/json', ...BLOCKSCOUT_AUTH_HEADERS } });
     return r.data?.result || '0x';
   } catch (e) {
     return '0x';
@@ -3898,8 +3914,8 @@ async function getEvmData(address, chainKey = 'ethereum') {
 
   // Token balances
   const [tokenRes, ethRes] = await Promise.all([
-    axios.get(`${base}/api/v2/addresses/${address}/token-balances`, { timeout:10000 }).catch(() => null),
-    axios.get(`${base}/api/v2/addresses/${address}`, { timeout:8000 }).catch(() => null),
+    axios.get(`${base}/api/v2/addresses/${address}/token-balances`, { timeout:10000, headers: BLOCKSCOUT_AUTH_HEADERS }).catch(() => null),
+    axios.get(`${base}/api/v2/addresses/${address}`, { timeout:8000, headers: BLOCKSCOUT_AUTH_HEADERS }).catch(() => null),
   ]);
 
   const tokens = [];
@@ -3916,7 +3932,7 @@ async function getEvmData(address, chainKey = 'ethereum') {
 
   if (nativeBal > 0) {
     // Native price: Blockscout stats first, DexScreener WETH pair as fallback
-    let nativePrice = await axios.get(`${base}/api/v2/stats`, { timeout:6000 })
+    let nativePrice = await axios.get(`${base}/api/v2/stats`, { timeout:6000, headers: BLOCKSCOUT_AUTH_HEADERS })
       .then(r => parseFloat(r.data?.coin_price || 0)).catch(() => 0);
     if (!nativePrice && nativeMint) {
       nativePrice = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${nativeMint}`, { timeout:6000 })
@@ -3964,7 +3980,7 @@ async function getEvmData(address, chainKey = 'ethereum') {
   }
 
   // Transactions
-  const txRes = await axios.get(`${base}/api/v2/addresses/${address}/transactions`, { timeout:10000 }).catch(() => null);
+  const txRes = await axios.get(`${base}/api/v2/addresses/${address}/transactions`, { timeout:10000, headers: BLOCKSCOUT_AUTH_HEADERS }).catch(() => null);
   const rawTxs = txRes?.data?.items || [];
   const txs = rawTxs.map(tx => ({
     hash:      tx.hash,
@@ -5128,7 +5144,7 @@ app.post('/api/trade/rpc/:chain', express.json({ limit: '100kb' }), async (req, 
     let lastErr;
     for (let attempt = 0; attempt <= 1; attempt++) {
       try {
-        const r = await axios.post(url, req.body, { timeout: 10000 });
+        const r = await axios.post(url, req.body, { timeout: 10000, headers: BLOCKSCOUT_AUTH_HEADERS });
         return res.json(r.data);
       } catch (e) {
         lastErr = e;
@@ -5161,7 +5177,7 @@ app.get('/api/trade/holdings/:wallet', async (req, res) => {
   await Promise.allSettled(Object.entries(BLOCKSCOUT_URLS).map(async ([chain, base]) => {
     // ERC-20 balances
     try {
-      const r = await axios.get(`${base}/api/v2/addresses/${wallet}/token-balances`, { timeout: 8000, maxRedirects: 3 });
+      const r = await axios.get(`${base}/api/v2/addresses/${wallet}/token-balances`, { timeout: 8000, maxRedirects: 3, headers: BLOCKSCOUT_AUTH_HEADERS });
       for (const t of (r.data || [])) {
         const tok = t.token || {};
         if (tok.type !== 'ERC-20' || !tok.decimals) continue;
@@ -5175,8 +5191,8 @@ app.get('/api/trade/holdings/:wallet', async (req, res) => {
     // Native balance + price
     try {
       const [balR, statsR] = await Promise.all([
-        axios.get(`${base}/api/v2/addresses/${wallet}`, { timeout: 8000, maxRedirects: 3 }),
-        axios.get(`${base}/api/v2/stats`, { timeout: 8000, maxRedirects: 3 }),
+        axios.get(`${base}/api/v2/addresses/${wallet}`, { timeout: 8000, maxRedirects: 3, headers: BLOCKSCOUT_AUTH_HEADERS }),
+        axios.get(`${base}/api/v2/stats`, { timeout: 8000, maxRedirects: 3, headers: BLOCKSCOUT_AUTH_HEADERS }),
       ]);
       const bal = Number(balR.data?.coin_balance || 0) / 1e18;
       const price = parseFloat(statsR.data?.coin_price || 0);
