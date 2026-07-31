@@ -13,6 +13,7 @@ const crypto       = require('crypto');
 const mysql        = require('mysql2/promise');
 const path         = require('path');
 const { ethers }   = require('ethers');
+const webpush      = require('web-push');
 
 const app    = express();
 const server = http.createServer(app);
@@ -232,6 +233,21 @@ async function initDb() {
   await _addCol('ALTER TABLE alert_notifications ADD COLUMN title VARCHAR(255)');
   await _addCol('ALTER TABLE alert_notifications ADD COLUMN subtitle VARCHAR(255)');
   await _addCol('ALTER TABLE alert_notifications ADD COLUMN detail TEXT');
+  // Browser push subscriptions (Web Push API) — one row per browser/device a
+  // wallet has enabled notifications on, since the same wallet can have
+  // several subscribed devices. endpoint is unique per subscription.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id         INT PRIMARY KEY AUTO_INCREMENT,
+      wallet     VARCHAR(255) NOT NULL,
+      endpoint   VARCHAR(600) NOT NULL,
+      p256dh     VARCHAR(255) NOT NULL,
+      auth       VARCHAR(255) NOT NULL,
+      created_at BIGINT NOT NULL,
+      UNIQUE KEY uniq_endpoint (endpoint(255)),
+      KEY idx_wallet (wallet)
+    )
+  `);
   // Community: paid-channel unlocks (one-time on-chain payment, verified then recorded here)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS channel_payments (
@@ -353,6 +369,21 @@ if (BLOCKSCOUT_API_KEY) {
   const rh = CHAIN_NETWORKS.robinhood.mainnet;
   rh.rpc = `https://api.blockscout.com/${rh.chainId}/json-rpc`;
   rh.blockscout = `https://api.blockscout.com/${rh.chainId}/api/v2`;
+}
+
+// ─── Web Push (browser notifications) ───────────────────────────────────────
+// Generate a pair with `node -e "console.log(require('web-push').generateVAPIDKeys())"`
+// and set both below — without them, push notifications are silently disabled
+// (subscribe endpoint returns 503) but the rest of the app still works.
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const PUSH_ENABLED = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
+if (PUSH_ENABLED) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || 'mailto:admin@bloombark.app',
+    VAPID_PUBLIC_KEY,
+    VAPID_PRIVATE_KEY
+  );
 }
 
 // Returns the active (testnet or mainnet, per NETWORK_ENV) config for a chain key
@@ -4341,6 +4372,58 @@ app.delete('/api/watchlist/:address', requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
+// ─── Web Push subscriptions (browser notifications for alerts) ─────────────
+app.get('/api/push/vapid-public-key', (req, res) => {
+  if (!PUSH_ENABLED) return res.status(503).json({ success: false, error: 'Push not configured' });
+  res.json({ success: true, publicKey: VAPID_PUBLIC_KEY });
+});
+
+app.post('/api/push/subscribe', requireAuth, async (req, res) => {
+  if (!PUSH_ENABLED) return res.status(503).json({ success: false, error: 'Push not configured' });
+  const { subscription } = req.body;
+  const endpoint = subscription?.endpoint;
+  const p256dh   = subscription?.keys?.p256dh;
+  const auth     = subscription?.keys?.auth;
+  if (!endpoint || !p256dh || !auth) return res.status(400).json({ error: 'Invalid subscription' });
+  await dbRun(`
+    INSERT INTO push_subscriptions (wallet, endpoint, p256dh, auth, created_at)
+    VALUES (?,?,?,?,?)
+    ON DUPLICATE KEY UPDATE wallet=VALUES(wallet), p256dh=VALUES(p256dh), auth=VALUES(auth)
+  `, [req.user.wallet, endpoint, p256dh, auth, Date.now()]);
+  res.json({ success: true });
+});
+
+app.post('/api/push/unsubscribe', requireAuth, async (req, res) => {
+  const { endpoint } = req.body;
+  if (!endpoint) return res.status(400).json({ error: 'endpoint required' });
+  await dbRun('DELETE FROM push_subscriptions WHERE wallet=? AND endpoint=?', [req.user.wallet, endpoint]);
+  res.json({ success: true });
+});
+
+// Sends a push notification to every device a wallet has subscribed, pruning
+// subscriptions the browser has since revoked (410 Gone / 404).
+async function _sendPushToWallet(wallet, payload) {
+  if (!PUSH_ENABLED) return;
+  let subs;
+  try {
+    subs = await dbAll('SELECT * FROM push_subscriptions WHERE wallet=?', [wallet]);
+  } catch (e) { console.error('[push] load subs failed:', e.message); return; }
+  for (const s of subs) {
+    try {
+      await webpush.sendNotification(
+        { endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } },
+        JSON.stringify(payload)
+      );
+    } catch (e) {
+      if (e.statusCode === 404 || e.statusCode === 410) {
+        await dbRun('DELETE FROM push_subscriptions WHERE id=?', [s.id]).catch(() => {});
+      } else {
+        console.error('[push] send failed:', e.message);
+      }
+    }
+  }
+}
+
 // ─── Token Alerts (per-watchlist-item MCAP/Volume % move alerts) ────────────
 // (tables created in initDb())
 
@@ -4479,6 +4562,11 @@ async function _checkTokenAlerts() {
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         `, [a.id, a.wallet, a.address, a.chain, a.name, a.symbol, a.metric, dir, a.baseline_value, extremeValue, changePct, message, Date.now()]);
         await dbRun('UPDATE token_alerts SET active=0, last_checked_at=? WHERE id=?', [Math.floor(Date.now() / 1000), a.id]);
+        _sendPushToWallet(a.wallet, {
+          title: `${a.symbol || a.name || 'Token'} alert triggered`,
+          body: message,
+          url: '/alerts',
+        }).catch(e => console.error('[push] alert notify failed:', e.message));
       } else {
         await dbRun('UPDATE token_alerts SET high_value=?, low_value=?, last_checked_at=? WHERE id=?', [highValue, lowValue, Math.floor(Date.now() / 1000), a.id]);
       }
