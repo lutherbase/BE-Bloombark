@@ -158,6 +158,28 @@ async function initDb() {
     )
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS sniper_pools (
+      id             INT PRIMARY KEY AUTO_INCREMENT,
+      chain          VARCHAR(64) NOT NULL DEFAULT 'robinhood',
+      pool_address   VARCHAR(255) NOT NULL,
+      token_address  VARCHAR(255) NOT NULL,
+      quote_address  VARCHAR(255),
+      symbol         VARCHAR(64),
+      name           VARCHAR(255),
+      decimals       INT,
+      source         VARCHAR(32),
+      block_number   BIGINT,
+      tx_hash        VARCHAR(80),
+      detected_at    BIGINT NOT NULL,
+      block_time     BIGINT,
+      price_usd      DOUBLE,
+      liquidity_usd  DOUBLE,
+      mcap_usd       DOUBLE,
+      enriched_at    BIGINT,
+      UNIQUE KEY uniq_chain_pool (chain, pool_address)
+    )
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS token_alerts (
       id              INT PRIMARY KEY AUTO_INCREMENT,
       wallet          VARCHAR(255) NOT NULL,
@@ -4465,6 +4487,151 @@ async function _checkTokenAlerts() {
 setTimeout(_checkTokenAlerts, 20000);
 setInterval(_checkTokenAlerts, 5 * 60 * 1000);
 
+// ─── Sniper Assistance: on-chain new-pool detector ──────────────────────────
+// Scans for the *universal* PairCreated (Uniswap V2 and every V2 fork —
+// confirmed this covers Robinhood chain's official Uniswap V2 deployment AND
+// the "Flap" launchpad's factory, since both emit the identical standard
+// signature) and V3 PoolCreated topics, chain-wide with no address filter —
+// so any current or future launchpad using either standard is caught
+// automatically without per-protocol integration. Deliberately does NOT
+// depend on GeckoTerminal/DexScreener for detection (only for enrichment,
+// best-effort, after the fact) since a pool seconds old usually isn't
+// indexed by them yet anyway.
+const ROBINHOOD_WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
+const PAIR_CREATED_TOPIC   = '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9';
+const POOL_CREATED_V3_TOPIC = '0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118';
+
+let _sniperLastBlock = 0;
+let _sniperScanning  = false;
+
+async function _sniperRpc(method, params) {
+  const r = await axios.post(RPC_URLS.robinhood,
+    { jsonrpc: '2.0', id: 1, method, params },
+    { timeout: 15000, headers: { 'Content-Type': 'application/json', ...BLOCKSCOUT_AUTH_HEADERS } });
+  if (r.data?.error) throw new Error(r.data.error.message || 'RPC error');
+  return r.data?.result;
+}
+
+// Decodes topics/data shared by both event shapes — pool/pair address always
+// ends up as the last 20 bytes of a 32-byte word, just at a different offset
+// in `data` depending on which event it is.
+function _sniperDecodeLog(log) {
+  const topic0 = (log.topics[0] || '').toLowerCase();
+  if (topic0 !== PAIR_CREATED_TOPIC && topic0 !== POOL_CREATED_V3_TOPIC) return null;
+  const token0 = '0x' + log.topics[1].slice(-40);
+  const token1 = '0x' + log.topics[2].slice(-40);
+  const dataHex = log.data.replace('0x', '');
+  const poolAddress = topic0 === PAIR_CREATED_TOPIC
+    ? '0x' + dataHex.slice(24, 64)          // PairCreated: data = [pair][uint256]
+    : '0x' + dataHex.slice(64 + 24, 128);   // PoolCreated: data = [tickSpacing][pool]
+  const source = topic0 === PAIR_CREATED_TOPIC ? 'v2_pair' : 'v3_pool';
+  return { token0, token1, poolAddress, source };
+}
+
+async function _sniperProcessLog(log) {
+  const decoded = _sniperDecodeLog(log);
+  if (!decoded) return;
+  const { token0, token1, poolAddress, source } = decoded;
+
+  const quoteAddr = ROBINHOOD_WETH.toLowerCase();
+  let tokenAddress, quoteAddress;
+  if (token0.toLowerCase() === quoteAddr) { tokenAddress = token1; quoteAddress = token0; }
+  else if (token1.toLowerCase() === quoteAddr) { tokenAddress = token0; quoteAddress = token1; }
+  else { tokenAddress = token0; quoteAddress = token1; } // exotic pair (neither side is WETH) — still record it, just can't assume which side is "the token"
+
+  const exists = await dbGet('SELECT id FROM sniper_pools WHERE chain=? AND pool_address=?', ['robinhood', poolAddress.toLowerCase()]);
+  if (exists) return;
+
+  const [symbolHex, nameHex, decHex] = await Promise.all([
+    _ethCall(RPC_URLS.robinhood, tokenAddress, '0x95d89b41').catch(() => '0x'), // symbol()
+    _ethCall(RPC_URLS.robinhood, tokenAddress, '0x06fdde03').catch(() => '0x'), // name()
+    _ethCall(RPC_URLS.robinhood, tokenAddress, '0x313ce567').catch(() => '0x'), // decimals()
+  ]);
+  const decodeStr = hex => {
+    try {
+      if (!hex || hex === '0x') return null;
+      const clean = hex.replace('0x', '');
+      const len = parseInt(clean.slice(64, 128), 16);
+      const bytes = Buffer.from(clean.slice(128, 128 + len * 2), 'hex');
+      return bytes.toString('utf8').replace(/\0/g, '').trim() || null;
+    } catch (e) { return null; }
+  };
+  const symbol = decodeStr(symbolHex);
+  const name = decodeStr(nameHex);
+  const decimals = decHex && decHex !== '0x' ? parseInt(decHex, 16) : 18;
+
+  await dbRun(`
+    INSERT INTO sniper_pools (chain, pool_address, token_address, quote_address, symbol, name, decimals, source, block_number, tx_hash, detected_at, block_time)
+    VALUES ('robinhood',?,?,?,?,?,?,?,?,?,?,?)
+    ON DUPLICATE KEY UPDATE id=id
+  `, [poolAddress.toLowerCase(), tokenAddress.toLowerCase(), quoteAddress.toLowerCase(), symbol, name, decimals, source,
+      parseInt(log.blockNumber, 16), log.transactionHash, Date.now(), null]);
+}
+
+async function _scanNewPools() {
+  if (_sniperScanning) return;
+  _sniperScanning = true;
+  try {
+    const latestHex = await _sniperRpc('eth_blockNumber', []);
+    const latest = parseInt(latestHex, 16);
+    if (!latest) return;
+    if (!_sniperLastBlock) _sniperLastBlock = Math.max(0, latest - 20); // bootstrap on first run
+    const fromBlock = _sniperLastBlock + 1;
+    if (fromBlock > latest) return;
+    const toBlock = Math.min(latest, fromBlock + 2000); // cap range per call
+
+    const logs = await _sniperRpc('eth_getLogs', [{
+      fromBlock: '0x' + fromBlock.toString(16),
+      toBlock: '0x' + toBlock.toString(16),
+      topics: [[PAIR_CREATED_TOPIC, POOL_CREATED_V3_TOPIC]],
+    }]) || [];
+
+    for (const log of logs) {
+      try { await _sniperProcessLog(log); } catch (e) { console.error('[sniper] log failed:', e.message); }
+    }
+    _sniperLastBlock = toBlock;
+    await _saveGenericCacheToDb('sniper_last_block', _sniperLastBlock);
+  } catch (e) {
+    console.error('[sniper] scan failed:', e.message);
+  } finally {
+    _sniperScanning = false;
+  }
+}
+setTimeout(_scanNewPools, 15000);
+setInterval(_scanNewPools, 8000);
+
+// Best-effort enrichment: fills in price/liquidity/mcap for recently-detected
+// pools once DexScreener has actually indexed them (usually within seconds to
+// a couple minutes — brand new pools often aren't there yet at detection
+// time, which is the whole reason detection doesn't wait on this).
+async function _enrichSniperPools() {
+  try {
+    const rows = await dbAll(`
+      SELECT * FROM sniper_pools
+      WHERE enriched_at IS NULL AND detected_at > ?
+      ORDER BY detected_at DESC LIMIT 20
+    `, [Date.now() - 60 * 60 * 1000]); // give up after 1 hour
+    for (const row of rows) {
+      try {
+        const dsRes = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${row.token_address}`, { timeout: 8000 }).catch(() => null);
+        const pairs = (dsRes?.data?.pairs || []).filter(p => p.chainId === 'robinhood' && p.pairAddress?.toLowerCase() === row.pool_address.toLowerCase());
+        if (pairs.length) {
+          const p = pairs[0];
+          await dbRun('UPDATE sniper_pools SET price_usd=?, liquidity_usd=?, mcap_usd=?, enriched_at=? WHERE id=?',
+            [parseFloat(p.priceUsd || 0), parseFloat(p.liquidity?.usd || 0), parseFloat(p.fdv || p.marketCap || 0), Date.now(), row.id]);
+        }
+      } catch (e) { /* leave unenriched, will retry next cycle until the 1h cutoff */ }
+    }
+  } catch (e) { console.error('[sniper] enrich failed:', e.message); }
+}
+setInterval(_enrichSniperPools, 15000);
+
+app.get('/api/sniper/pools', async (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+  const rows = await dbAll('SELECT * FROM sniper_pools ORDER BY detected_at DESC LIMIT ?', [limit]);
+  res.json({ success: true, pools: rows });
+});
+
 // ─── Keep-alive: Render's free/starter tier spins the service down after
 // ~15 min with no inbound HTTP traffic. When that happens the whole Node
 // process pauses — including every setInterval-based background job above
@@ -5316,10 +5483,11 @@ initDb()
     await _loadNarrativeCacheFromDb();
     // Restore Market Overview's three data sources so a cold boot serves
     // last-known-good data immediately instead of an empty state.
-    const [volCache, txCache, tabCache] = await Promise.all([
+    const [volCache, txCache, tabCache, sniperBlock] = await Promise.all([
       _loadGenericCacheFromDb('market_chain_volume_cache'),
       _loadGenericCacheFromDb('market_chain_tx_cache'),
       _loadGenericCacheFromDb('market_tab_cache'),
+      _loadGenericCacheFromDb('sniper_last_block'),
     ]);
     if (volCache?.data) { _chainVolumeCache = volCache; console.log(`[market] restored chain-volume cache from DB (age ${Math.round((Date.now()-volCache.at)/60000)}min)`); }
     if (txCache?.data) { _chainTxCache = txCache; console.log(`[market] restored chain-tx cache from DB (age ${Math.round((Date.now()-txCache.at)/60000)}min)`); }
@@ -5327,6 +5495,7 @@ initDb()
       for (const [k, v] of Object.entries(tabCache)) _marketTabCache.set(k, v);
       console.log(`[market] restored ${Object.keys(tabCache).length} market-tab cache entries from DB`);
     }
+    if (typeof sniperBlock === 'number' && sniperBlock > 0) { _sniperLastBlock = sniperBlock; console.log(`[sniper] resuming scan from block ${sniperBlock}`); }
     server.listen(PORT, () => console.log(`Bloombark Terminal Backend running on port ${PORT}`));
   })
   .catch((e) => {
