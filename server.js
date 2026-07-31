@@ -248,6 +248,31 @@ async function initDb() {
       KEY idx_wallet (wallet)
     )
   `);
+  // AI Track Record — every directional (bullish/bearish) prediction from
+  // /api/predict gets logged here, then resolved ~24h later against the
+  // actual price move. Public, transparent win-rate (unlike most platforms
+  // that only show predictions, never their outcomes). Neutral calls are
+  // deliberately not logged — they'd muddy a win/loss stat with no clear
+  // right answer.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS prediction_history (
+      id           INT PRIMARY KEY AUTO_INCREMENT,
+      address      VARCHAR(255) NOT NULL,
+      chain        VARCHAR(64) NOT NULL,
+      symbol       VARCHAR(64),
+      name         VARCHAR(255),
+      signal       VARCHAR(16) NOT NULL,
+      confidence   INT NOT NULL,
+      price_at     DOUBLE NOT NULL,
+      predicted_at BIGINT NOT NULL,
+      resolved_at  BIGINT,
+      price_after  DOUBLE,
+      change_pct   DOUBLE,
+      outcome      VARCHAR(16),
+      KEY idx_resolved (resolved_at),
+      KEY idx_predicted_at (predicted_at)
+    )
+  `);
   // Community: paid-channel unlocks (one-time on-chain payment, verified then recorded here)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS channel_payments (
@@ -4213,6 +4238,16 @@ app.post('/api/predict', async (req, res) => {
       generatedAt: new Date().toISOString(),
     });
 
+    // Log directional calls for the public AI Track Record — deliberately
+    // skips NEUTRAL (no clear right/wrong to resolve against later).
+    if (verdict === 'BULLISH' || verdict === 'BEARISH') {
+      dbRun(`
+        INSERT INTO prediction_history (address, chain, symbol, name, signal, confidence, price_at, predicted_at)
+        VALUES (?,?,?,?,?,?,?,?)
+      `, [address.toLowerCase(), chain || pair.chainId, pair.baseToken?.symbol, pair.baseToken?.name,
+          verdict, confidence, parseFloat(pair.priceUsd || 0), Date.now()]).catch(e => console.error('[track-record] log failed:', e.message));
+    }
+
   } catch (e) {
     console.error('[predict]', e.message);
     res.json({ success: false, error: e.message });
@@ -4578,6 +4613,78 @@ async function _checkTokenAlerts() {
 }
 setTimeout(_checkTokenAlerts, 20000);
 setInterval(_checkTokenAlerts, 5 * 60 * 1000);
+
+// ─── AI Track Record resolver ────────────────────────────────────────────────
+// Every directional prediction gets checked ~24h later against the actual
+// price move: BULLISH is "correct" if price rose, BEARISH if it fell (small
+// dead-band around 0% to avoid crediting/blaming pure noise).
+const PREDICTION_RESOLVE_AGE_MS = 24 * 60 * 60 * 1000;
+const PREDICTION_FLAT_BAND_PCT  = 1.5;
+
+async function _resolvePredictionHistory() {
+  let rows;
+  try {
+    rows = await dbAll(
+      'SELECT * FROM prediction_history WHERE resolved_at IS NULL AND predicted_at <= ? LIMIT 20',
+      [Date.now() - PREDICTION_RESOLVE_AGE_MS]
+    );
+  } catch (e) { console.error('[track-record] load failed:', e.message); return; }
+
+  for (const row of rows) {
+    try {
+      const { data } = await axios.get(`${DEXSCREENER}/latest/dex/tokens/${row.address}`, { timeout: 8000 });
+      const pairs = (data?.pairs || []).filter(p => p.chainId === row.chain)
+        .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+      const priceAfter = parseFloat(pairs[0]?.priceUsd || 0);
+      if (!(priceAfter > 0)) continue;
+
+      const changePct = ((priceAfter - row.price_at) / row.price_at) * 100;
+      let outcome;
+      if (Math.abs(changePct) < PREDICTION_FLAT_BAND_PCT) outcome = 'flat';
+      else if (row.signal === 'BULLISH') outcome = changePct > 0 ? 'correct' : 'incorrect';
+      else outcome = changePct < 0 ? 'correct' : 'incorrect';
+
+      await dbRun(
+        'UPDATE prediction_history SET resolved_at=?, price_after=?, change_pct=?, outcome=? WHERE id=?',
+        [Date.now(), priceAfter, changePct, outcome, row.id]
+      );
+    } catch (e) {
+      console.error('[track-record] resolve failed for', row.address, e.message);
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+}
+setTimeout(_resolvePredictionHistory, 30000);
+setInterval(_resolvePredictionHistory, 15 * 60 * 1000);
+
+// Public — no auth, deliberately transparent even when the AI is wrong.
+app.get('/api/predict/track-record', async (req, res) => {
+  try {
+    const resolved = await dbAll(
+      `SELECT * FROM prediction_history WHERE resolved_at IS NOT NULL ORDER BY resolved_at DESC LIMIT 200`
+    );
+    const decisive = resolved.filter(r => r.outcome === 'correct' || r.outcome === 'incorrect');
+    const correct = decisive.filter(r => r.outcome === 'correct').length;
+    const winRatePct = decisive.length ? Math.round((correct / decisive.length) * 1000) / 10 : null;
+    const pending = await dbGet('SELECT COUNT(*) AS c FROM prediction_history WHERE resolved_at IS NULL');
+
+    res.json({
+      success: true,
+      totalResolved: decisive.length,
+      correct,
+      winRatePct,
+      pendingCount: pending?.c || 0,
+      recent: resolved.slice(0, 30).map(r => ({
+        symbol: r.symbol, name: r.name, chain: r.chain, signal: r.signal, confidence: r.confidence,
+        priceAt: r.price_at, priceAfter: r.price_after, changePct: r.change_pct, outcome: r.outcome,
+        predictedAt: r.predicted_at, resolvedAt: r.resolved_at,
+      })),
+    });
+  } catch (e) {
+    console.error('[track-record] endpoint failed:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 // ─── Sniper Assistance: on-chain new-pool detector ──────────────────────────
 // Scans for the *universal* PairCreated (Uniswap V2 and every V2 fork —
