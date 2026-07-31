@@ -4597,8 +4597,15 @@ async function _scanNewPools() {
     _sniperScanning = false;
   }
 }
-setTimeout(_scanNewPools, 15000);
-setInterval(_scanNewPools, 8000);
+// Disabled by default — this loop hits eth_getLogs every 8s nonstop and was
+// the main driver burning through the Blockscout Pro API's monthly credit
+// quota, starving other Robinhood-chain features (RPC calls, chain-tx stats)
+// of credits. Re-enable via env once credits/plan are sorted out.
+const SNIPER_SCANNER_ENABLED = process.env.SNIPER_SCANNER_ENABLED === 'true';
+if (SNIPER_SCANNER_ENABLED) {
+  setTimeout(_scanNewPools, 15000);
+  setInterval(_scanNewPools, 8000);
+}
 
 // Best-effort enrichment: fills in price/liquidity/mcap for recently-detected
 // pools once DexScreener has actually indexed them (usually within seconds to
@@ -4624,7 +4631,9 @@ async function _enrichSniperPools() {
     }
   } catch (e) { console.error('[sniper] enrich failed:', e.message); }
 }
-setInterval(_enrichSniperPools, 15000);
+if (SNIPER_SCANNER_ENABLED) {
+  setInterval(_enrichSniperPools, 15000);
+}
 
 app.get('/api/sniper/pools', async (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
