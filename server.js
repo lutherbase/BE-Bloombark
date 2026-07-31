@@ -380,7 +380,7 @@ const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const PUSH_ENABLED = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
 if (PUSH_ENABLED) {
   webpush.setVapidDetails(
-    process.env.VAPID_SUBJECT || 'mailto:admin@bloombark.app',
+    process.env.VAPID_SUBJECT || 'mailto:bloombarkterminal@gmail.com',
     VAPID_PUBLIC_KEY,
     VAPID_PRIVATE_KEY
   );
