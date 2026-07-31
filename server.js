@@ -5021,6 +5021,100 @@ app.post('/api/trade/kyber/build', express.json({ limit: '1mb' }), async (req, r
   }
 });
 
+// ─── KyberSwap Limit Order proxy (gasless — sign only, no tx to create) ────
+// Robinhood-chain only, hardcoded server-side — never trust a client-supplied
+// chainId here. Confirmed live against KyberSwap's Limit Order API: Robinhood
+// (4663) uses their newer "DSLO Protocol" contract (0xcab2FA2eeab7065B45CBc
+// F6E3936dDE2506b4f6C) rather than the older LimitOrderProtocol used on most
+// other chains, but the Maker API endpoints behave identically either way.
+const LIMIT_ORDER_API = 'https://limit-order.kyberswap.com';
+const LIMIT_ORDER_CHAIN_ID = '4663';
+
+app.post('/api/trade/limit-order/sign-message', express.json({ limit: '10kb' }), async (req, res) => {
+  try {
+    const { makerAsset, takerAsset, maker, makingAmount, takingAmount, expiredAt, receiver } = req.body || {};
+    if (!makerAsset || !takerAsset || !maker || !makingAmount || !takingAmount || !expiredAt) {
+      return res.status(400).json({ error: 'missing params' });
+    }
+    const r = await axios.post(`${LIMIT_ORDER_API}/write/api/v1/orders/sign-message`, {
+      chainId: LIMIT_ORDER_CHAIN_ID, makerAsset, takerAsset, maker, makingAmount, takingAmount, expiredAt,
+      ...(receiver ? { receiver } : {}),
+    }, { timeout: 10000 });
+    res.json(r.data);
+  } catch (e) {
+    res.status(502).json({ error: e.response?.data?.message || e.message });
+  }
+});
+
+app.post('/api/trade/limit-order', express.json({ limit: '10kb' }), async (req, res) => {
+  try {
+    const { makerAsset, takerAsset, maker, makingAmount, takingAmount, expiredAt, salt, signature, receiver } = req.body || {};
+    if (!makerAsset || !takerAsset || !maker || !makingAmount || !takingAmount || !expiredAt || !salt || !signature) {
+      return res.status(400).json({ error: 'missing params' });
+    }
+    const r = await axios.post(`${LIMIT_ORDER_API}/write/api/v1/orders`, {
+      chainId: LIMIT_ORDER_CHAIN_ID, makerAsset, takerAsset, maker, makingAmount, takingAmount, expiredAt, salt, signature,
+      ...(receiver ? { receiver } : {}),
+    }, { timeout: 10000 });
+    res.json(r.data);
+  } catch (e) {
+    res.status(502).json({ error: e.response?.data?.message || e.message });
+  }
+});
+
+app.get('/api/trade/limit-orders/:maker', async (req, res) => {
+  try {
+    const status = ['open', 'filled', 'cancelled', 'expired'].includes(req.query.status) ? req.query.status : 'open';
+    const r = await axios.get(`${LIMIT_ORDER_API}/read-ks/api/v1/orders`, {
+      params: { chainId: LIMIT_ORDER_CHAIN_ID, maker: req.params.maker, status },
+      timeout: 10000,
+    });
+    res.json(r.data);
+  } catch (e) {
+    res.status(502).json({ error: e.response?.data?.message || e.message });
+  }
+});
+
+app.get('/api/trade/limit-order/active-amount', async (req, res) => {
+  try {
+    const { maker, makerAsset } = req.query;
+    if (!maker || !makerAsset) return res.status(400).json({ error: 'missing params' });
+    const r = await axios.get(`${LIMIT_ORDER_API}/read-ks/api/v1/orders/active-making-amount`, {
+      params: { chainId: LIMIT_ORDER_CHAIN_ID, maker, makerAsset },
+      timeout: 10000,
+    });
+    res.json(r.data);
+  } catch (e) {
+    res.status(502).json({ error: e.response?.data?.message || e.message });
+  }
+});
+
+app.post('/api/trade/limit-order/cancel-sign', express.json({ limit: '10kb' }), async (req, res) => {
+  try {
+    const { maker, orderIds } = req.body || {};
+    if (!maker || !Array.isArray(orderIds) || !orderIds.length) return res.status(400).json({ error: 'missing params' });
+    const r = await axios.post(`${LIMIT_ORDER_API}/write/api/v1/orders/cancel-sign`, {
+      chainId: LIMIT_ORDER_CHAIN_ID, maker, orderIds,
+    }, { timeout: 10000 });
+    res.json(r.data);
+  } catch (e) {
+    res.status(502).json({ error: e.response?.data?.message || e.message });
+  }
+});
+
+app.post('/api/trade/limit-order/cancel', express.json({ limit: '10kb' }), async (req, res) => {
+  try {
+    const { maker, orderIds, signature } = req.body || {};
+    if (!maker || !Array.isArray(orderIds) || !orderIds.length || !signature) return res.status(400).json({ error: 'missing params' });
+    const r = await axios.post(`${LIMIT_ORDER_API}/write/api/v1/orders/cancel`, {
+      chainId: LIMIT_ORDER_CHAIN_ID, maker, orderIds, signature,
+    }, { timeout: 10000 });
+    res.json(r.data);
+  } catch (e) {
+    res.status(502).json({ error: e.response?.data?.message || e.message });
+  }
+});
+
 // JSON-RPC proxy to public nodes (decimals, balance, allowance reads)
 app.post('/api/trade/rpc/:chain', express.json({ limit: '100kb' }), async (req, res) => {
   try {
