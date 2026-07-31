@@ -4673,7 +4673,8 @@ app.get('/api/predict/track-record', async (req, res) => {
     // "which tokens has the AI actually called" reference list, separate
     // from the win/loss detail rows above).
     const tokenRows = await dbAll(`
-      SELECT address, chain, symbol, name, image_url, MAX(predicted_at) AS last_predicted_at
+      SELECT address, chain, MAX(symbol) AS symbol, MAX(name) AS name, MAX(image_url) AS image_url,
+             MAX(predicted_at) AS last_predicted_at
       FROM prediction_history
       GROUP BY address, chain
       ORDER BY last_predicted_at DESC
