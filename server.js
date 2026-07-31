@@ -261,7 +261,7 @@ async function initDb() {
       chain        VARCHAR(64) NOT NULL,
       symbol       VARCHAR(64),
       name         VARCHAR(255),
-      signal       VARCHAR(16) NOT NULL,
+      \`signal\`   VARCHAR(16) NOT NULL,
       confidence   INT NOT NULL,
       price_at     DOUBLE NOT NULL,
       predicted_at BIGINT NOT NULL,
@@ -4243,7 +4243,7 @@ app.post('/api/predict', async (req, res) => {
     // skips NEUTRAL (no clear right/wrong to resolve against later).
     if (verdict === 'BULLISH' || verdict === 'BEARISH') {
       dbRun(`
-        INSERT INTO prediction_history (address, chain, symbol, name, signal, confidence, price_at, predicted_at, image_url)
+        INSERT INTO prediction_history (address, chain, symbol, name, \`signal\`, confidence, price_at, predicted_at, image_url)
         VALUES (?,?,?,?,?,?,?,?,?)
       `, [address.toLowerCase(), chain || pair.chainId, pair.baseToken?.symbol, pair.baseToken?.name,
           verdict, confidence, parseFloat(pair.priceUsd || 0), Date.now(), pair.info?.imageUrl || null]).catch(e => console.error('[track-record] log failed:', e.message));
