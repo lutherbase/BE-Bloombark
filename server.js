@@ -394,7 +394,11 @@ const BLOCKSCOUT_AUTH_HEADERS = BLOCKSCOUT_API_KEY ? { Authorization: `Bearer ${
 if (BLOCKSCOUT_API_KEY) {
   const rh = CHAIN_NETWORKS.robinhood.mainnet;
   rh.rpc = `https://api.blockscout.com/${rh.chainId}/json-rpc`;
-  rh.blockscout = `https://api.blockscout.com/${rh.chainId}/api/v2`;
+  // Every consumer of .blockscout appends its own `/api/v2/...` path (see
+  // getEvmData, _fetchOnchainSwaps, _fetchChainTransactions) — this must be
+  // the bare host, not pre-suffixed with /api/v2, or every REST call doubles
+  // the path (…/api/v2/api/v2/stats) and 404s against the Pro API gateway.
+  rh.blockscout = `https://api.blockscout.com/${rh.chainId}`;
 }
 
 // ─── Web Push (browser notifications) ───────────────────────────────────────
