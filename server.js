@@ -274,6 +274,23 @@ async function initDb() {
     )
   `);
   await _addCol('ALTER TABLE prediction_history ADD COLUMN image_url VARCHAR(500)');
+  // "Trending on Bloombark" — internal activity signal (scans + trades),
+  // separate from the GeckoTerminal-sourced Trending tab in Market Overview.
+  // Community mentions are computed on the fly from chat_messages instead of
+  // logged here, since that data already exists.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS token_activity_log (
+      id      INT PRIMARY KEY AUTO_INCREMENT,
+      address VARCHAR(255) NOT NULL,
+      chain   VARCHAR(64) NOT NULL,
+      symbol  VARCHAR(64),
+      name    VARCHAR(255),
+      \`type\` VARCHAR(16) NOT NULL,
+      ts      BIGINT NOT NULL,
+      KEY idx_type_ts (\`type\`, ts),
+      KEY idx_address (address)
+    )
+  `);
   // Community: paid-channel unlocks (one-time on-chain payment, verified then recorded here)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS channel_payments (
@@ -2113,6 +2130,12 @@ app.post('/api/analyze', async (req, res) => {
     };
 
     res.json({ success: true, data: response, source: 'live' });
+
+    // Log for "Trending on Bloombark" (internal scan-activity signal).
+    dbRun(
+      'INSERT INTO token_activity_log (address, chain, symbol, name, `type`, ts) VALUES (?,?,?,?,?,?)',
+      [response.address.toLowerCase(), response.chain, response.symbol, response.name, 'scan', Date.now()]
+    ).catch(e => console.error('[trending-log] scan insert failed:', e.message));
   } catch (err) {
     console.error('Analyze error:', err.message);
     res.status(500).json({ error: 'Analysis failed', message: err.message });
@@ -4712,6 +4735,92 @@ app.get('/api/predict/track-record', async (req, res) => {
     });
   } catch (e) {
     console.error('[track-record] endpoint failed:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ─── Trending on Bloombark ───────────────────────────────────────────────────
+// Internal-activity trending — deliberately separate from Market Overview's
+// GeckoTerminal-sourced "Trending" tab, which is price/volume-based. This one
+// tracks what's actually happening ON Bloombark itself: what people are
+// scanning, discussing (excluding Holders/Private/$BBRK Moon — those rooms
+// aren't general token discussion), and trading.
+const TRENDING_ROOM_EXCLUDE = ['holders', 'private', 'moon'];
+const CA_REGEX = /0x[a-fA-F0-9]{40}/g;
+
+app.post('/api/trade/log-activity', (req, res) => {
+  const { address, chain, symbol, name } = req.body || {};
+  if (!address || !chain) return res.status(400).json({ success: false, error: 'address and chain required' });
+  dbRun(
+    'INSERT INTO token_activity_log (address, chain, symbol, name, `type`, ts) VALUES (?,?,?,?,?,?)',
+    [String(address).toLowerCase(), chain, symbol || null, name || null, 'trade', Date.now()]
+  ).catch(e => console.error('[trending-log] trade insert failed:', e.message));
+  res.json({ success: true });
+});
+
+const TRENDING_TTL_MS = 5 * 60 * 1000;
+let _trendingCache = { data: null, at: 0 };
+
+app.get('/api/trending-bloombark', async (req, res) => {
+  if (_trendingCache.data && Date.now() - _trendingCache.at < TRENDING_TTL_MS) {
+    return res.json({ success: true, ...(_trendingCache.data) });
+  }
+  try {
+    const since = Date.now() - 24 * 60 * 60 * 1000;
+
+    const scanRows = await dbAll(`
+      SELECT address, chain, MAX(symbol) AS symbol, MAX(name) AS name, COUNT(*) AS cnt
+      FROM token_activity_log WHERE \`type\`='scan' AND ts > ? GROUP BY address, chain
+      ORDER BY cnt DESC LIMIT 10
+    `, [since]);
+    const tradeRows = await dbAll(`
+      SELECT address, chain, MAX(symbol) AS symbol, MAX(name) AS name, COUNT(*) AS cnt
+      FROM token_activity_log WHERE \`type\`='trade' AND ts > ? GROUP BY address, chain
+      ORDER BY cnt DESC LIMIT 10
+    `, [since]);
+
+    // Community mentions: pull recent messages from non-excluded rooms, then
+    // regex-extract addresses in JS (chat text has no structured CA field).
+    const placeholders = TRENDING_ROOM_EXCLUDE.map(() => '?').join(',');
+    const messages = await dbAll(
+      `SELECT text FROM chat_messages WHERE ts > ? AND room NOT IN (${placeholders})`,
+      [since, ...TRENDING_ROOM_EXCLUDE]
+    );
+    const mentionCounts = {};
+    for (const m of messages) {
+      const found = (m.text || '').match(CA_REGEX) || [];
+      for (const addr of found) {
+        const key = addr.toLowerCase();
+        mentionCounts[key] = (mentionCounts[key] || 0) + 1;
+      }
+    }
+    // Best-effort symbol/name lookup for mentioned addresses from activity log.
+    const mentionAddrs = Object.keys(mentionCounts).sort((a, b) => mentionCounts[b] - mentionCounts[a]).slice(0, 10);
+    let mentionRows = [];
+    if (mentionAddrs.length) {
+      const mp = mentionAddrs.map(() => '?').join(',');
+      const meta = await dbAll(
+        `SELECT address, MAX(chain) AS chain, MAX(symbol) AS symbol, MAX(name) AS name
+         FROM token_activity_log WHERE address IN (${mp}) GROUP BY address`,
+        mentionAddrs
+      );
+      const metaMap = Object.fromEntries(meta.map(m => [m.address, m]));
+      mentionRows = mentionAddrs.map(addr => ({
+        address: addr, chain: metaMap[addr]?.chain || null,
+        symbol: metaMap[addr]?.symbol || null, name: metaMap[addr]?.name || null,
+        cnt: mentionCounts[addr],
+      }));
+    }
+
+    const data = {
+      mostScanned: scanRows.map(r => ({ address: r.address, chain: r.chain, symbol: r.symbol, name: r.name, count: r.cnt })),
+      mostDiscussed: mentionRows.map(r => ({ address: r.address, chain: r.chain, symbol: r.symbol, name: r.name, count: r.cnt })),
+      mostTraded: tradeRows.map(r => ({ address: r.address, chain: r.chain, symbol: r.symbol, name: r.name, count: r.cnt })),
+    };
+    _trendingCache = { data, at: Date.now() };
+    res.json({ success: true, ...data });
+  } catch (e) {
+    console.error('[trending-bloombark] failed:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
