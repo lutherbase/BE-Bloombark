@@ -2990,13 +2990,16 @@ app.get('/api/chain-volumes', async (req, res) => {
 const CHAIN_TX_TTL = 10 * 60 * 1000;
 let _chainTxCache = { data: null, at: 0 };
 
+let _chainTxLastErrors = {}; // temporary debug aid — key: chain, value: last fetch error message
+
 async function _fetchChainTransactions() {
   const chains = Object.keys(CHAIN_NETWORKS);
   const entries = await Promise.all(chains.map(async (key) => {
     try {
       const base = chainCfg(key).blockscout;
-      if (!base) return [key, null];
+      if (!base) { _chainTxLastErrors[key] = 'no blockscout base URL configured'; return [key, null]; }
       const { data } = await axios.get(`${base}/api/v2/stats`, { timeout: 10000, headers: BLOCKSCOUT_AUTH_HEADERS });
+      delete _chainTxLastErrors[key];
       return [key, {
         transactionsToday: parseInt(data?.transactions_today || 0),
         totalTransactions: parseInt(data?.total_transactions || 0),
@@ -3007,7 +3010,9 @@ async function _fetchChainTransactions() {
         } : null,
       }];
     } catch (e) {
-      console.error(`[chain-tx] ${key} failed:`, e.message);
+      const msg = e.response ? `HTTP ${e.response.status}: ${JSON.stringify(e.response.data)}` : e.message;
+      _chainTxLastErrors[key] = msg;
+      console.error(`[chain-tx] ${key} failed:`, msg);
       return [key, null];
     }
   }));
@@ -3017,7 +3022,10 @@ async function _fetchChainTransactions() {
 app.get('/api/chain-transactions', async (req, res) => {
   const enabledChains = await _getEnabledChains();
   let data;
-  if (_chainTxCache.data && Date.now() - _chainTxCache.at < CHAIN_TX_TTL) {
+  if (req.query.debug === '1') {
+    // Bypass cache entirely so the errors reflect this exact request.
+    data = await _fetchChainTransactions();
+  } else if (_chainTxCache.data && Date.now() - _chainTxCache.at < CHAIN_TX_TTL) {
     data = _chainTxCache.data;
   } else {
     data = await _fetchChainTransactions();
@@ -3025,7 +3033,9 @@ app.get('/api/chain-transactions', async (req, res) => {
     _saveGenericCacheToDb('market_chain_tx_cache', _chainTxCache);
   }
   const filtered = Object.fromEntries(Object.entries(data).filter(([k, v]) => enabledChains.includes(k) && v));
-  res.json({ success: true, data: filtered });
+  const payload = { success: true, data: filtered };
+  if (req.query.debug === '1') payload._debug = { enabledChains, rawKeys: Object.keys(data), errors: _chainTxLastErrors };
+  res.json(payload);
 });
 
 // ─── Market Overview tabs (Robinhood-chain launch view): Pools, Trending,
