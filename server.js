@@ -4706,7 +4706,7 @@ app.get('/api/predict/track-record', async (req, res) => {
     const winRatePct = decisive.length ? Math.round((correct / decisive.length) * 1000) / 10 : null;
     const pendingCountRow = await dbGet('SELECT COUNT(*) AS c FROM prediction_history WHERE resolved_at IS NULL');
     const pendingRows = await dbAll(`
-      SELECT address, chain, symbol, name, image_url, signal, confidence, predicted_at
+      SELECT address, chain, symbol, name, image_url, \`signal\`, confidence, predicted_at
       FROM prediction_history
       WHERE resolved_at IS NULL
       ORDER BY predicted_at DESC
