@@ -4725,9 +4725,9 @@ app.get('/api/predict/track-record', async (req, res) => {
       winRatePct,
       pendingCount: pending?.c || 0,
       recent: resolved.slice(0, 30).map(r => ({
-        symbol: r.symbol, name: r.name, chain: r.chain, signal: r.signal, confidence: r.confidence,
+        address: r.address, symbol: r.symbol, name: r.name, chain: r.chain, signal: r.signal, confidence: r.confidence,
         priceAt: r.price_at, priceAfter: r.price_after, changePct: r.change_pct, outcome: r.outcome,
-        predictedAt: r.predicted_at, resolvedAt: r.resolved_at,
+        predictedAt: r.predicted_at, resolvedAt: r.resolved_at, imageUrl: r.image_url,
       })),
       tokens: tokenRows.map(t => ({
         address: t.address, chain: t.chain, symbol: t.symbol, name: t.name, imageUrl: t.image_url,
