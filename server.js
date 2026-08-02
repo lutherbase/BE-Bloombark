@@ -4704,7 +4704,14 @@ app.get('/api/predict/track-record', async (req, res) => {
     const decisive = resolved.filter(r => r.outcome === 'correct' || r.outcome === 'incorrect');
     const correct = decisive.filter(r => r.outcome === 'correct').length;
     const winRatePct = decisive.length ? Math.round((correct / decisive.length) * 1000) / 10 : null;
-    const pending = await dbGet('SELECT COUNT(*) AS c FROM prediction_history WHERE resolved_at IS NULL');
+    const pendingCountRow = await dbGet('SELECT COUNT(*) AS c FROM prediction_history WHERE resolved_at IS NULL');
+    const pendingRows = await dbAll(`
+      SELECT address, chain, symbol, name, image_url, signal, confidence, predicted_at
+      FROM prediction_history
+      WHERE resolved_at IS NULL
+      ORDER BY predicted_at DESC
+      LIMIT 100
+    `);
 
     // Distinct tokens ever covered (ticker + CA + image only — a quick
     // "which tokens has the AI actually called" reference list, separate
@@ -4723,11 +4730,15 @@ app.get('/api/predict/track-record', async (req, res) => {
       totalResolved: decisive.length,
       correct,
       winRatePct,
-      pendingCount: pending?.c || 0,
+      pendingCount: pendingCountRow?.c || 0,
       recent: resolved.slice(0, 30).map(r => ({
         address: r.address, symbol: r.symbol, name: r.name, chain: r.chain, signal: r.signal, confidence: r.confidence,
         priceAt: r.price_at, priceAfter: r.price_after, changePct: r.change_pct, outcome: r.outcome,
         predictedAt: r.predicted_at, resolvedAt: r.resolved_at, imageUrl: r.image_url,
+      })),
+      pending: pendingRows.map(p => ({
+        address: p.address, chain: p.chain, symbol: p.symbol, name: p.name, imageUrl: p.image_url,
+        signal: p.signal, confidence: p.confidence, predictedAt: p.predicted_at,
       })),
       tokens: tokenRows.map(t => ({
         address: t.address, chain: t.chain, symbol: t.symbol, name: t.name, imageUrl: t.image_url,
