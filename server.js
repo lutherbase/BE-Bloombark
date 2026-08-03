@@ -4508,12 +4508,15 @@ app.get('/api/alerts', requireAuth, async (req, res) => {
 app.post('/api/alerts', requireAuth, async (req, res) => {
   const { address, chain, name, symbol, metric, baselineValue, thresholdPct, direction } = req.body;
   if (!address || !chain) return res.status(400).json({ error: 'address and chain required' });
-  if (!['mcap', 'volume'].includes(metric)) return res.status(400).json({ error: 'metric must be mcap or volume' });
+  if (!['mcap', 'volume', 'price'].includes(metric)) return res.status(400).json({ error: 'metric must be mcap, volume, or price' });
   const dir = ['up', 'down', 'both'].includes(direction) ? direction : 'both';
   const baseline = parseFloat(baselineValue);
-  const threshold = parseFloat(thresholdPct);
-  if (!(baseline > 0)) return res.status(400).json({ error: 'baselineValue must be > 0' });
-  if (!(threshold > 0)) return res.status(400).json({ error: 'thresholdPct must be > 0' });
+  // For 'price' alerts baselineValue IS the absolute target price the user
+  // set — it's compared directly against the live price, not as a % move
+  // origin, so thresholdPct is meaningless and not required.
+  const threshold = metric === 'price' ? 0 : parseFloat(thresholdPct);
+  if (!(baseline > 0)) return res.status(400).json({ error: metric === 'price' ? 'target price must be > 0' : 'baselineValue must be > 0' });
+  if (metric !== 'price' && !(threshold > 0)) return res.status(400).json({ error: 'thresholdPct must be > 0' });
   await dbRun(`
     INSERT INTO token_alerts (wallet, address, chain, name, symbol, metric, baseline_value, threshold_pct, direction, active, high_value, low_value)
     VALUES (?,?,?,?,?,?,?,?,?,1,?,?)
@@ -4603,8 +4606,8 @@ async function _checkTokenAlerts() {
         .sort((x, y) => (y.liquidity?.usd || 0) - (x.liquidity?.usd || 0));
       if (!pairs.length) continue;
       const p = pairs[0];
-      const currentValue = a.metric === 'mcap'
-        ? parseFloat(p.fdv || p.marketCap || 0)
+      const currentValue = a.metric === 'mcap' ? parseFloat(p.fdv || p.marketCap || 0)
+        : a.metric === 'price' ? parseFloat(p.priceUsd || 0)
         : parseFloat(p.volume?.h24 || 0);
       if (!(currentValue > 0)) continue;
 
@@ -4614,10 +4617,22 @@ async function _checkTokenAlerts() {
       // runs every 5 min) would never fire.
       const highValue = Math.max(a.high_value ?? a.baseline_value, currentValue);
       const lowValue = Math.min(a.low_value ?? a.baseline_value, currentValue);
-      const upPct = ((highValue - a.baseline_value) / a.baseline_value) * 100;
-      const downPct = ((lowValue - a.baseline_value) / a.baseline_value) * 100;
-      const crossedUp = upPct >= a.threshold_pct;
-      const crossedDown = downPct <= -a.threshold_pct;
+
+      // 'price' alerts fire when the live price touches an absolute target
+      // (baseline_value IS the target, not a % move origin) — mcap/volume
+      // alerts fire on a % move away from baseline.
+      let crossedUp, crossedDown, changePctForUp, changePctForDown;
+      if (a.metric === 'price') {
+        crossedUp = highValue >= a.baseline_value;
+        crossedDown = lowValue <= a.baseline_value;
+        changePctForUp = ((highValue - a.baseline_value) / a.baseline_value) * 100;
+        changePctForDown = ((lowValue - a.baseline_value) / a.baseline_value) * 100;
+      } else {
+        changePctForUp = ((highValue - a.baseline_value) / a.baseline_value) * 100;
+        changePctForDown = ((lowValue - a.baseline_value) / a.baseline_value) * 100;
+        crossedUp = changePctForUp >= a.threshold_pct;
+        crossedDown = changePctForDown <= -a.threshold_pct;
+      }
       const shouldFire = (a.direction === 'up' && crossedUp) ||
                           (a.direction === 'down' && crossedDown) ||
                           (a.direction === 'both' && (crossedUp || crossedDown));
@@ -4625,11 +4640,13 @@ async function _checkTokenAlerts() {
       if (shouldFire) {
         // If both directions crossed (direction:'both'), report whichever
         // moved further from baseline.
-        const dir = crossedUp && (!crossedDown || upPct >= Math.abs(downPct)) ? 'up' : 'down';
-        const changePct = dir === 'up' ? upPct : downPct;
+        const dir = crossedUp && (!crossedDown || changePctForUp >= Math.abs(changePctForDown)) ? 'up' : 'down';
+        const changePct = dir === 'up' ? changePctForUp : changePctForDown;
         const extremeValue = dir === 'up' ? highValue : lowValue;
-        const label = a.metric === 'mcap' ? 'Market Cap' : 'Volume';
-        const message = `${a.symbol || a.name || 'Token'} ${label} moved ${dir} ${Math.abs(changePct).toFixed(1)}% (threshold ${a.threshold_pct}%)`;
+        const label = a.metric === 'mcap' ? 'Market Cap' : a.metric === 'price' ? 'Price' : 'Volume';
+        const message = a.metric === 'price'
+          ? `${a.symbol || a.name || 'Token'} Price reached your target of $${a.baseline_value} (now $${extremeValue})`
+          : `${a.symbol || a.name || 'Token'} ${label} moved ${dir} ${Math.abs(changePct).toFixed(1)}% (threshold ${a.threshold_pct}%)`;
         await dbRun(`
           INSERT INTO alert_notifications (alert_id, wallet, address, chain, name, symbol, metric, direction, baseline_value, new_value, change_pct, message, ts)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
