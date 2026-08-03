@@ -4611,28 +4611,47 @@ async function _checkTokenAlerts() {
         : parseFloat(p.volume?.h24 || 0);
       if (!(currentValue > 0)) continue;
 
+      if (a.metric === 'price') {
+        // Price alerts are repeatable and edge-based on the LIVE value each
+        // poll (not a cumulative high/low watermark) — so once the price
+        // moves away from the target it stops firing, and it fires again
+        // every time it comes back and touches it. No cooldown: if the
+        // price sits flapping across the target, this can fire on every
+        // 5-min poll — that's intentional, not a bug.
+        const crossedUp = currentValue >= a.baseline_value;
+        const crossedDown = currentValue <= a.baseline_value;
+        const shouldFire = (a.direction === 'up' && crossedUp) ||
+                            (a.direction === 'down' && crossedDown) ||
+                            (a.direction === 'both' && (crossedUp || crossedDown));
+        if (shouldFire) {
+          const dir = currentValue >= a.baseline_value ? 'up' : 'down';
+          const changePct = ((currentValue - a.baseline_value) / a.baseline_value) * 100;
+          const message = `${a.symbol || a.name || 'Token'} Price reached your target of $${a.baseline_value} (now $${currentValue})`;
+          await dbRun(`
+            INSERT INTO alert_notifications (alert_id, wallet, address, chain, name, symbol, metric, direction, baseline_value, new_value, change_pct, message, ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+          `, [a.id, a.wallet, a.address, a.chain, a.name, a.symbol, a.metric, dir, a.baseline_value, currentValue, changePct, message, Date.now()]);
+          _sendPushToWallet(a.wallet, {
+            title: `${a.symbol || a.name || 'Token'} alert triggered`,
+            body: message,
+            url: '/alerts',
+          }).catch(e => console.error('[push] alert notify failed:', e.message));
+        }
+        await dbRun('UPDATE token_alerts SET last_checked_at=? WHERE id=?', [Math.floor(Date.now() / 1000), a.id]);
+        await new Promise(r => setTimeout(r, 300));
+        continue;
+      }
+
       // Compare against the high/low watermark reached since the baseline was
       // set, not just this instant's snapshot — otherwise a spike that
       // crosses the threshold and reverts between two poll cycles (this job
       // runs every 5 min) would never fire.
       const highValue = Math.max(a.high_value ?? a.baseline_value, currentValue);
       const lowValue = Math.min(a.low_value ?? a.baseline_value, currentValue);
-
-      // 'price' alerts fire when the live price touches an absolute target
-      // (baseline_value IS the target, not a % move origin) — mcap/volume
-      // alerts fire on a % move away from baseline.
-      let crossedUp, crossedDown, changePctForUp, changePctForDown;
-      if (a.metric === 'price') {
-        crossedUp = highValue >= a.baseline_value;
-        crossedDown = lowValue <= a.baseline_value;
-        changePctForUp = ((highValue - a.baseline_value) / a.baseline_value) * 100;
-        changePctForDown = ((lowValue - a.baseline_value) / a.baseline_value) * 100;
-      } else {
-        changePctForUp = ((highValue - a.baseline_value) / a.baseline_value) * 100;
-        changePctForDown = ((lowValue - a.baseline_value) / a.baseline_value) * 100;
-        crossedUp = changePctForUp >= a.threshold_pct;
-        crossedDown = changePctForDown <= -a.threshold_pct;
-      }
+      const changePctForUp = ((highValue - a.baseline_value) / a.baseline_value) * 100;
+      const changePctForDown = ((lowValue - a.baseline_value) / a.baseline_value) * 100;
+      const crossedUp = changePctForUp >= a.threshold_pct;
+      const crossedDown = changePctForDown <= -a.threshold_pct;
       const shouldFire = (a.direction === 'up' && crossedUp) ||
                           (a.direction === 'down' && crossedDown) ||
                           (a.direction === 'both' && (crossedUp || crossedDown));
@@ -4643,10 +4662,8 @@ async function _checkTokenAlerts() {
         const dir = crossedUp && (!crossedDown || changePctForUp >= Math.abs(changePctForDown)) ? 'up' : 'down';
         const changePct = dir === 'up' ? changePctForUp : changePctForDown;
         const extremeValue = dir === 'up' ? highValue : lowValue;
-        const label = a.metric === 'mcap' ? 'Market Cap' : a.metric === 'price' ? 'Price' : 'Volume';
-        const message = a.metric === 'price'
-          ? `${a.symbol || a.name || 'Token'} Price reached your target of $${a.baseline_value} (now $${extremeValue})`
-          : `${a.symbol || a.name || 'Token'} ${label} moved ${dir} ${Math.abs(changePct).toFixed(1)}% (threshold ${a.threshold_pct}%)`;
+        const label = a.metric === 'mcap' ? 'Market Cap' : 'Volume';
+        const message = `${a.symbol || a.name || 'Token'} ${label} moved ${dir} ${Math.abs(changePct).toFixed(1)}% (threshold ${a.threshold_pct}%)`;
         await dbRun(`
           INSERT INTO alert_notifications (alert_id, wallet, address, chain, name, symbol, metric, direction, baseline_value, new_value, change_pct, message, ts)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
