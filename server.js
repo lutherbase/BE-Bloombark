@@ -3274,6 +3274,9 @@ async function _resolveHoldersGateUsdBasis() {
 async function checkChannelGate(room, wallet) {
   const gate = CHANNEL_GATES[room];
   if (!gate) return { gated: false, ok: true };
+  // Admin wallets bypass every paywall/holder gate — no need to actually buy
+  // in or hold $BBRK to access Holders/Private for moderation purposes.
+  if (isAdminWallet(wallet)) return { gated: true, kind: gate.kind, ok: true, isAdminBypass: true };
   const cfg     = chainCfg(gate.chain);
   const network = cfg.name || (gate.chain.charAt(0).toUpperCase() + gate.chain.slice(1));
 
