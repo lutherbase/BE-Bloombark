@@ -5524,6 +5524,59 @@ async function _adminClearChat(req, res) {
 app.get('/api/admin/clear-chat', _adminClearChat);
 app.post('/api/admin/clear-chat', express.json(), _adminClearChat);
 
+// Delete or edit a single AI Track Record row (prediction_history). Not
+// exposed anywhere in the frontend — dev-only maintenance via curl/Postman.
+// Same admin token as the other /api/admin/* endpoints.
+async function _adminDeleteTrackRecord(req, res) {
+  if (!ADMIN_QUERY_TOKEN) return res.status(404).json({ error: 'not enabled' });
+  const token = req.get('x-admin-token') || req.query.token || (req.body && req.body.token) || '';
+  if (token !== ADMIN_QUERY_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const id = parseInt(req.query.id ?? (req.body && req.body.id));
+  if (!id) return res.status(400).json({ error: 'id required' });
+  try {
+    const result = await dbRun('DELETE FROM prediction_history WHERE id=?', [id]);
+    res.json({ ok: true, id, deleted: result?.affectedRows ?? null });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+}
+app.get('/api/admin/track-record/delete', _adminDeleteTrackRecord);
+app.post('/api/admin/track-record/delete', express.json(), _adminDeleteTrackRecord);
+
+const TRACK_RECORD_EDITABLE_COLS = new Set([
+  'symbol', 'name', 'signal', 'confidence', 'price_at', 'predicted_at',
+  'resolved_at', 'price_after', 'change_pct', 'outcome', 'image_url',
+]);
+async function _adminUpdateTrackRecord(req, res) {
+  if (!ADMIN_QUERY_TOKEN) return res.status(404).json({ error: 'not enabled' });
+  const token = req.get('x-admin-token') || req.query.token || (req.body && req.body.token) || '';
+  if (token !== ADMIN_QUERY_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const src = req.method === 'GET' ? req.query : (req.body || {});
+  const id = parseInt(src.id);
+  if (!id) return res.status(400).json({ error: 'id required' });
+  const sets = [];
+  const values = [];
+  for (const col of TRACK_RECORD_EDITABLE_COLS) {
+    if (src[col] !== undefined) {
+      sets.push(`\`${col}\`=?`);
+      values.push(src[col]);
+    }
+  }
+  if (!sets.length) {
+    return res.status(400).json({ error: `no editable fields provided — allowed: ${[...TRACK_RECORD_EDITABLE_COLS].join(', ')}` });
+  }
+  try {
+    values.push(id);
+    await dbRun(`UPDATE prediction_history SET ${sets.join(', ')} WHERE id=?`, values);
+    const row = await dbGet('SELECT * FROM prediction_history WHERE id=?', [id]);
+    res.json({ ok: true, updated: row });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+}
+app.get('/api/admin/track-record/update', _adminUpdateTrackRecord);
+app.post('/api/admin/track-record/update', express.json(), _adminUpdateTrackRecord);
+
 // ─── Trading proxy (KyberSwap aggregator, EVM only) ─────────────────────────
 // Note: KyberSwap does not index testnet liquidity — quotes/swaps will return
 // no route in testnet mode. This mapping is left as mainnet-only slugs.
