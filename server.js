@@ -2326,6 +2326,7 @@ app.post('/api/recent-trades', async (req, res) => {
 
     const limit = Math.min(Math.max(parseInt(reqLimit) || 30, 1), 300);
     let trades = [];
+    let geckoFailed = false;
     try {
       const url = `https://api.geckoterminal.com/api/v2/networks/${network}/pools/${poolAddress}/trades?limit=${limit}`;
       const { data } = await _geckoGetWithRetry(url, { timeout: 10000, headers: GECKO_HEADS });
@@ -2361,6 +2362,7 @@ app.post('/api/recent-trades', async (req, res) => {
       });
     } catch (e) {
       trades = []; // 404/other — fall through to on-chain fallback below
+      geckoFailed = true;
     }
 
     if (!trades.length && chain) {
@@ -2369,7 +2371,15 @@ app.post('/api/recent-trades', async (req, res) => {
     }
 
     const payload = { success: true, trades };
-    _recentTradesCache.set(cacheKey, { data: payload, at: Date.now() });
+    // Don't cache a transient failure as if it were a confirmed "this pool
+    // has no trades" — that would keep serving an empty result for the full
+    // TTL even after the upstream hiccup passes, making the frontend's
+    // recent-trades table look like it "disappeared" for several poll
+    // cycles. Only cache empty results when Gecko actually responded (a
+    // real 0-trade pool), not when it errored out.
+    if (trades.length || !geckoFailed) {
+      _recentTradesCache.set(cacheKey, { data: payload, at: Date.now() });
+    }
     res.json(payload);
   } catch (e) {
     res.json({ success: false, trades: [], error: e.message });
