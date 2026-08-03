@@ -4591,9 +4591,11 @@ app.post('/api/admin/alerts/blast/clear', requireAuth, async (req, res) => {
   res.json({ success: true, deleted: result.affectedRows });
 });
 
-// Background checker: periodically compares each active alert's current MCAP/Volume
-// (via DexScreener) against its baseline + threshold%, fires a notification and
-// deactivates the alert (one-shot) when the move is crossed.
+// Background checker: periodically compares each active alert's current
+// value (via DexScreener) against its baseline + threshold. All three
+// metrics (mcap/volume/price) are repeatable — evaluated off the LIVE value
+// each poll (not a cumulative high/low watermark), no cooldown: they fire
+// again every time the condition is met, and never auto-deactivate.
 async function _checkTokenAlerts() {
   let alerts;
   try {
@@ -4611,72 +4613,33 @@ async function _checkTokenAlerts() {
         : parseFloat(p.volume?.h24 || 0);
       if (!(currentValue > 0)) continue;
 
-      if (a.metric === 'price') {
-        // Price alerts are repeatable and edge-based on the LIVE value each
-        // poll (not a cumulative high/low watermark) — so once the price
-        // moves away from the target it stops firing, and it fires again
-        // every time it comes back and touches it. No cooldown: if the
-        // price sits flapping across the target, this can fire on every
-        // 5-min poll — that's intentional, not a bug.
-        const crossedUp = currentValue >= a.baseline_value;
-        const crossedDown = currentValue <= a.baseline_value;
-        const shouldFire = (a.direction === 'up' && crossedUp) ||
-                            (a.direction === 'down' && crossedDown) ||
-                            (a.direction === 'both' && (crossedUp || crossedDown));
-        if (shouldFire) {
-          const dir = currentValue >= a.baseline_value ? 'up' : 'down';
-          const changePct = ((currentValue - a.baseline_value) / a.baseline_value) * 100;
-          const message = `${a.symbol || a.name || 'Token'} Price reached your target of $${a.baseline_value} (now $${currentValue})`;
-          await dbRun(`
-            INSERT INTO alert_notifications (alert_id, wallet, address, chain, name, symbol, metric, direction, baseline_value, new_value, change_pct, message, ts)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-          `, [a.id, a.wallet, a.address, a.chain, a.name, a.symbol, a.metric, dir, a.baseline_value, currentValue, changePct, message, Date.now()]);
-          _sendPushToWallet(a.wallet, {
-            title: `${a.symbol || a.name || 'Token'} alert triggered`,
-            body: message,
-            url: '/alerts',
-          }).catch(e => console.error('[push] alert notify failed:', e.message));
-        }
-        await dbRun('UPDATE token_alerts SET last_checked_at=? WHERE id=?', [Math.floor(Date.now() / 1000), a.id]);
-        await new Promise(r => setTimeout(r, 300));
-        continue;
-      }
-
-      // Compare against the high/low watermark reached since the baseline was
-      // set, not just this instant's snapshot — otherwise a spike that
-      // crosses the threshold and reverts between two poll cycles (this job
-      // runs every 5 min) would never fire.
-      const highValue = Math.max(a.high_value ?? a.baseline_value, currentValue);
-      const lowValue = Math.min(a.low_value ?? a.baseline_value, currentValue);
-      const changePctForUp = ((highValue - a.baseline_value) / a.baseline_value) * 100;
-      const changePctForDown = ((lowValue - a.baseline_value) / a.baseline_value) * 100;
-      const crossedUp = changePctForUp >= a.threshold_pct;
-      const crossedDown = changePctForDown <= -a.threshold_pct;
+      const changePct = ((currentValue - a.baseline_value) / a.baseline_value) * 100;
+      // 'price' fires on touching an absolute target (baseline_value IS the
+      // target); mcap/volume fire once the live value has moved threshold_pct%
+      // away from baseline in the watched direction.
+      const crossedUp = a.metric === 'price' ? currentValue >= a.baseline_value : changePct >= a.threshold_pct;
+      const crossedDown = a.metric === 'price' ? currentValue <= a.baseline_value : changePct <= -a.threshold_pct;
       const shouldFire = (a.direction === 'up' && crossedUp) ||
                           (a.direction === 'down' && crossedDown) ||
                           (a.direction === 'both' && (crossedUp || crossedDown));
 
       if (shouldFire) {
-        // If both directions crossed (direction:'both'), report whichever
-        // moved further from baseline.
-        const dir = crossedUp && (!crossedDown || changePctForUp >= Math.abs(changePctForDown)) ? 'up' : 'down';
-        const changePct = dir === 'up' ? changePctForUp : changePctForDown;
-        const extremeValue = dir === 'up' ? highValue : lowValue;
-        const label = a.metric === 'mcap' ? 'Market Cap' : 'Volume';
-        const message = `${a.symbol || a.name || 'Token'} ${label} moved ${dir} ${Math.abs(changePct).toFixed(1)}% (threshold ${a.threshold_pct}%)`;
+        const dir = changePct >= 0 ? 'up' : 'down';
+        const label = a.metric === 'mcap' ? 'Market Cap' : a.metric === 'price' ? 'Price' : 'Volume';
+        const message = a.metric === 'price'
+          ? `${a.symbol || a.name || 'Token'} Price reached your target of $${a.baseline_value} (now $${currentValue})`
+          : `${a.symbol || a.name || 'Token'} ${label} moved ${dir} ${Math.abs(changePct).toFixed(1)}% (threshold ${a.threshold_pct}%)`;
         await dbRun(`
           INSERT INTO alert_notifications (alert_id, wallet, address, chain, name, symbol, metric, direction, baseline_value, new_value, change_pct, message, ts)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        `, [a.id, a.wallet, a.address, a.chain, a.name, a.symbol, a.metric, dir, a.baseline_value, extremeValue, changePct, message, Date.now()]);
-        await dbRun('UPDATE token_alerts SET active=0, last_checked_at=? WHERE id=?', [Math.floor(Date.now() / 1000), a.id]);
+        `, [a.id, a.wallet, a.address, a.chain, a.name, a.symbol, a.metric, dir, a.baseline_value, currentValue, changePct, message, Date.now()]);
         _sendPushToWallet(a.wallet, {
           title: `${a.symbol || a.name || 'Token'} alert triggered`,
           body: message,
           url: '/alerts',
         }).catch(e => console.error('[push] alert notify failed:', e.message));
-      } else {
-        await dbRun('UPDATE token_alerts SET high_value=?, low_value=?, last_checked_at=? WHERE id=?', [highValue, lowValue, Math.floor(Date.now() / 1000), a.id]);
       }
+      await dbRun('UPDATE token_alerts SET last_checked_at=? WHERE id=?', [Math.floor(Date.now() / 1000), a.id]);
     } catch (e) {
       console.error('[alerts] check failed for', a.address, e.message);
     }
