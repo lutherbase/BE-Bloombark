@@ -4162,6 +4162,18 @@ app.post('/api/predict', async (req, res) => {
     const liqUsd  = pair.liquidity?.usd   || 0;
     const fdv     = pair.fdv || pair.marketCap || 0;
 
+    // Token age — a brand-new pool naturally has thin liquidity and
+    // concentrated holders (deployer + first buyers) that would otherwise
+    // look identical to a rug in progress. Bucket the age so the
+    // liquidity/holder thresholds below (and the final confidence) can be
+    // read relative to how long the pool has actually had to mature,
+    // instead of one fixed bar for a 10-minute-old pool and a 6-month-old one.
+    const poolAgeMs    = pair.pairCreatedAt ? Date.now() - pair.pairCreatedAt : null;
+    const poolAgeHours = poolAgeMs != null ? poolAgeMs / 3600000 : null;
+    const isBrandNew   = poolAgeHours != null && poolAgeHours < 6;   // <6h
+    const isNew        = poolAgeHours != null && poolAgeHours < 24;  // <24h
+    const isYoung      = poolAgeHours != null && poolAgeHours < 168; // <7d
+
     // GoPlus security check
     const gpChain = GOPLUS_CHAIN[chain] || GOPLUS_CHAIN['ethereum'];
     const gpRes = await axios.get(`https://api.gopluslabs.io/api/v1/token_security/${gpChain}?contract_addresses=${address}`, { timeout: 6000 }).catch(() => null);
@@ -4218,29 +4230,57 @@ app.post('/api/predict', async (req, res) => {
       }
     }
 
-    // 4. Liquidity health
+    // 4. Liquidity health — bars are relaxed for young pools, which start
+    // thin by construction and aren't necessarily riskier for it.
+    const liqHealthyBar = isBrandNew ? 20000 : isNew ? 50000 : 100000;
+    const liqRiskyBar   = isBrandNew ? 3000  : isNew ? 6000  : 10000;
     const liqToVol = vol24h > 0 ? liqUsd / vol24h : 0;
-    if (liqUsd > 100000 && liqToVol > 0.1) {
+    if (liqUsd > liqHealthyBar && liqToVol > 0.1) {
       bullScore += 10;
-      signals.push({ label: 'Liquidity', verdict: 'bullish', detail: `$${(liqUsd/1000).toFixed(1)}K — healthy depth` });
-    } else if (liqUsd < 10000) {
+      signals.push({ label: 'Liquidity', verdict: 'bullish', detail: `$${(liqUsd/1000).toFixed(1)}K — healthy depth${isNew ? ' for pool age' : ''}` });
+    } else if (liqUsd < liqRiskyBar) {
       bearScore += 15;
       signals.push({ label: 'Liquidity', verdict: 'bearish', detail: `$${(liqUsd/1000).toFixed(1)}K — very low, high slippage risk` });
     } else {
       signals.push({ label: 'Liquidity', verdict: 'neutral', detail: `$${(liqUsd/1000).toFixed(1)}K` });
     }
 
-    // 5. Holder concentration (from GoPlus)
+    // 5. Holder concentration (from GoPlus) — a brand-new pool is
+    // dominated by the deployer + first buyers almost by definition, so the
+    // "well distributed" / "high concentration" bars widen for young pools
+    // rather than flagging every fresh launch as bearish on this alone.
+    const holderGoodTop10 = isBrandNew ? 55 : isNew ? 45 : 30;
+    const holderGoodCreator = isBrandNew ? 15 : isNew ? 10 : 5;
+    const holderBadTop10  = isBrandNew ? 85 : isNew ? 75 : 60;
+    const holderBadCreator = isBrandNew ? 45 : isNew ? 35 : 20;
     if (holderCount > 0) {
-      if (top10Pct < 30 && creatorPct < 5) {
+      if (top10Pct < holderGoodTop10 && creatorPct < holderGoodCreator) {
         bullScore += 15;
-        signals.push({ label: 'Holder Distribution', verdict: 'bullish', detail: `Top 10 hold ${top10Pct.toFixed(1)}% · Creator ${creatorPct.toFixed(1)}% — well distributed` });
-      } else if (top10Pct > 60 || creatorPct > 20) {
+        signals.push({ label: 'Holder Distribution', verdict: 'bullish', detail: `Top 10 hold ${top10Pct.toFixed(1)}% · Creator ${creatorPct.toFixed(1)}% — well distributed${isNew ? ' for pool age' : ''}` });
+      } else if (top10Pct > holderBadTop10 || creatorPct > holderBadCreator) {
         bearScore += 20;
         signals.push({ label: 'Holder Distribution', verdict: 'bearish', detail: `Top 10 hold ${top10Pct.toFixed(1)}% · Creator ${creatorPct.toFixed(1)}% — high concentration risk` });
       } else {
         signals.push({ label: 'Holder Distribution', verdict: 'neutral', detail: `Top 10: ${top10Pct.toFixed(1)}% · ${holderCount.toLocaleString()} holders` });
       }
+    }
+
+    // 6. Token age — its own signal, separate from the threshold adjustments
+    // above: very young pools are inherently higher-risk (no track record,
+    // classic rug window), while pools that have survived past the first
+    // week with liquidity intact are a mild positive signal in themselves.
+    if (poolAgeHours == null) {
+      signals.push({ label: 'Token Age', verdict: 'neutral', detail: 'Pool creation time unavailable' });
+    } else if (isBrandNew) {
+      bearScore += 15;
+      signals.push({ label: 'Token Age', verdict: 'bearish', detail: `${poolAgeHours < 1 ? Math.round(poolAgeHours * 60) + 'm' : poolAgeHours.toFixed(1) + 'h'} old — classic rug-risk window, thresholds relaxed but stay cautious` });
+    } else if (isNew) {
+      signals.push({ label: 'Token Age', verdict: 'neutral', detail: `${poolAgeHours.toFixed(0)}h old — still early, limited trading history` });
+    } else if (isYoung) {
+      signals.push({ label: 'Token Age', verdict: 'neutral', detail: `${Math.round(poolAgeHours / 24)}d old — building track record` });
+    } else {
+      bullScore += 10;
+      signals.push({ label: 'Token Age', verdict: 'bullish', detail: `${Math.round(poolAgeHours / 24)}d old — established, survived past the early rug window` });
     }
 
     // 6. Security flags
@@ -4265,7 +4305,11 @@ app.post('/api/predict', async (req, res) => {
     else                 { verdict = 'NEUTRAL';  signal = 'neutral'; }
 
     const total_weight = bullScore + bearScore || 1;
-    const confidence = Math.min(95, Math.round(Math.abs(net) / total_weight * 100 + 30));
+    // Cap confidence for very young pools — there simply isn't enough
+    // trading history yet for any signal combination to be as reliable as
+    // the same reading on an established pool.
+    const confidenceCap = isBrandNew ? 65 : isNew ? 80 : 95;
+    const confidence = Math.min(confidenceCap, Math.round(Math.abs(net) / total_weight * 100 + 30));
 
     const summary = signal === 'bullish'
       ? `Majority of signals point upward. Buy pressure dominates with ${(buyRatio*100).toFixed(0)}% buys, price momentum ${momentum > 0 ? 'positive' : 'mixed'} across timeframes.`
