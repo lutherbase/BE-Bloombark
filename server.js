@@ -3398,16 +3398,11 @@ function shortAddr(addr) {
 
 // ─── Bloombark Chat Bot: auto-analyzes contract addresses posted in chat ─────
 const BOT_NAME = 'BloomBot';
-// Bloombark logo (4-color square grid) as the bot's avatar
-const BOT_AVATAR = 'data:image/svg+xml;base64,' + Buffer.from(
-  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="64" height="64">
-    <rect width="24" height="24" rx="6" fill="#13161d"/>
-    <rect x="3" y="3" width="8" height="8" rx="2" fill="#E86C3A"/>
-    <rect x="13" y="3" width="8" height="8" rx="2" fill="#F5A623"/>
-    <rect x="3" y="13" width="8" height="8" rx="2" fill="#27C97F"/>
-    <rect x="13" y="13" width="8" height="8" rx="2" fill="#4a90d9"/>
-  </svg>`
-).toString('base64');
+// Same lockup used for the sidebar/favicon — served by the frontend static
+// root, resolved by the browser against the page's own origin (not this
+// API's), so a root-relative path works regardless of where this backend
+// is hosted.
+const BOT_AVATAR = '/assets/brand/logo.png';
 const BOT_CHAINS = new Set(['ethereum', 'base', 'arbitrum', 'polygon', 'optimism', 'robinhood']);
 const _botCooldown = new Map(); // ca -> last reply ts (avoid spamming same CA)
 
