@@ -4824,7 +4824,10 @@ const TRENDING_TTL_MS = 5 * 60 * 1000;
 let _trendingCache = { data: null, at: 0 };
 
 app.get('/api/trending-bloombark', async (req, res) => {
-  if (_trendingCache.data && Date.now() - _trendingCache.at < TRENDING_TTL_MS) {
+  // ?refresh=1 bypasses the cache — used by the frontend's Refresh button so
+  // a just-posted mention/scan/trade doesn't sit invisible for up to 5min.
+  const bypassCache = req.query.refresh === '1';
+  if (!bypassCache && _trendingCache.data && Date.now() - _trendingCache.at < TRENDING_TTL_MS) {
     return res.json({ success: true, ...(_trendingCache.data) });
   }
   try {
