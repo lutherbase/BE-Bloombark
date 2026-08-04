@@ -3560,7 +3560,11 @@ async function _chatBotAnalyze(ca, roomKey, reply = null) {
       liquidity: parseFloat(p.liquidity?.usd || 0),
       volume24h: parseFloat(p.volume?.h24 || 0),
       buyRatio, signal, confidence,
-      imageUrl: p.info?.imageUrl || null,
+      // DexScreener's pair-level `info.imageUrl` is a profile/banner image,
+      // not the token's actual logo (hence odd/unrelated pictures showing
+      // up here) — the real per-token logo lives on this CDN path instead,
+      // same one the frontend's dashLogoUrl() helper uses everywhere else.
+      imageUrl: `https://dd.dexscreener.com/ds-data/tokens/${p.chainId}/${p.baseToken.address}.png`,
     };
 
     const sigEmoji = signal === 'BULLISH' ? '🟢' : signal === 'BEARISH' ? '🔴' : '🟡';
