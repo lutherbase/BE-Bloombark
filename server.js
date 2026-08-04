@@ -3456,8 +3456,8 @@ function _botSvgCard(info) {
   <rect x="0.5" y="0.5" width="559" height="329" rx="16" fill="none" stroke="#27c97f40"/>
   <rect x="0" y="0" width="560" height="52" rx="16" fill="#161a23"/>
   <rect x="0" y="36" width="560" height="16" fill="#161a23"/>
-  <circle cx="30" cy="26" r="9" fill="#27c97f22" stroke="#27c97f" stroke-width="1.5"/>
-  <path d="M26 29 L30 21 L34 29" stroke="#27c97f" stroke-width="1.5" fill="none"/>
+  <clipPath id="headerLogoClip"><circle cx="30" cy="26" r="9"/></clipPath>
+  <image href="${BOT_AVATAR}" x="21" y="17" width="18" height="18" clip-path="url(#headerLogoClip)" preserveAspectRatio="xMidYMid slice"/>
   <text x="48" y="30" font-family="Menlo, monospace" font-size="13" font-weight="bold" fill="#e2e8f0" letter-spacing="2">BLOOMBARK</text>
   <text x="152" y="30" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1">AI TOKEN SCAN</text>
   <rect x="${560 - 118}" y="14" width="96" height="24" rx="12" fill="${sigColor}22" stroke="${sigColor}"/>
