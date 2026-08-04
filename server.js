@@ -3465,10 +3465,16 @@ function _botSvgCard(info) {
 
   <circle cx="46" cy="94" r="20" fill="#27c97f1f"/>
   <text x="46" y="100" font-family="Menlo, monospace" font-size="16" font-weight="bold" fill="#27c97f" text-anchor="middle">${_svgEsc((info.symbol || '?')[0])}</text>
+  ${info.imageUrl ? `<clipPath id="tokenLogoClip"><circle cx="46" cy="94" r="20"/></clipPath>
+  <image href="${_svgEsc(info.imageUrl)}" x="26" y="74" width="40" height="40" clip-path="url(#tokenLogoClip)" preserveAspectRatio="xMidYMid slice"/>` : ''}
   <text x="78" y="88" font-family="Menlo, monospace" font-size="19" font-weight="bold" fill="#e2e8f0">${_svgEsc(info.symbol)}</text>
   <text x="78" y="106" font-family="Menlo, monospace" font-size="11" fill="#6b7280">${_svgEsc((info.name || '').slice(0, 34))}</text>
-  <rect x="${78 + Math.min(String(info.symbol||'').length, 12) * 12 + 10}" y="72" width="${info.chain.length * 8 + 18}" height="19" rx="9.5" fill="#27c97f15" stroke="#27c97f50"/>
-  <text x="${78 + Math.min(String(info.symbol||'').length, 12) * 12 + 19}" y="85" font-family="Menlo, monospace" font-size="9" font-weight="bold" fill="#27c97f" letter-spacing="1">${_svgEsc(info.chain.toUpperCase())}</text>
+  ${(() => {
+    const badgeX = 78 + Math.min(String(info.symbol||'').length, 12) * 12 + 10;
+    const badgeW = info.chain.length * 8 + 18;
+    return `<rect x="${badgeX}" y="72" width="${badgeW}" height="19" rx="9.5" fill="#27c97f15" stroke="#27c97f50"/>
+  <text x="${badgeX + badgeW / 2}" y="85" font-family="Menlo, monospace" font-size="9" font-weight="bold" fill="#27c97f" letter-spacing="1" text-anchor="middle">${_svgEsc(info.chain.toUpperCase())}</text>`;
+  })()}
 
   <text x="28" y="168" font-family="Menlo, monospace" font-size="9" fill="#6b7280" letter-spacing="1.5">CURRENT PRICE</text>
   <text x="28" y="204" font-family="Menlo, monospace" font-size="32" font-weight="bold" fill="#27c97f">${_svgEsc(_botFmtPrice(info.price))}</text>
@@ -3554,6 +3560,7 @@ async function _chatBotAnalyze(ca, roomKey, reply = null) {
       liquidity: parseFloat(p.liquidity?.usd || 0),
       volume24h: parseFloat(p.volume?.h24 || 0),
       buyRatio, signal, confidence,
+      imageUrl: p.info?.imageUrl || null,
     };
 
     const sigEmoji = signal === 'BULLISH' ? '🟢' : signal === 'BEARISH' ? '🔴' : '🟡';
