@@ -4620,7 +4620,7 @@ app.delete('/api/alerts/token/:address', requireAuth, async (req, res) => {
 });
 
 app.get('/api/alerts/notifications', requireAuth, async (req, res) => {
-  const rows = await dbAll('SELECT * FROM alert_notifications WHERE wallet=? ORDER BY ts DESC LIMIT 100', [req.user.wallet]);
+  const rows = await dbAll('SELECT * FROM alert_notifications WHERE wallet=? ORDER BY ts DESC LIMIT 1000', [req.user.wallet]);
   const unread = rows.filter(r => !r.is_read).length;
   res.json({ success: true, items: rows, unread });
 });
