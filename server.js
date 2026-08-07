@@ -5942,9 +5942,15 @@ const RPC_URLS = Object.fromEntries(Object.keys(CHAIN_NETWORKS).map(k => [k, cha
 // coming from Render's datacenter IPs — a class of traffic Cloudflare's bot
 // heuristics commonly flag regardless of request volume. Blockscout's eth-rpc
 // proxy is the fallback of last resort for THIS server-to-server path only
-// (still capped, but better than a hard failure).
+// (still capped, but better than a hard failure). Hardcoded rather than
+// derived from chainCfg('robinhood').blockscout, because that field gets
+// mutated to the REST API base (api.blockscout.com/<id>, no /api/eth-rpc
+// route) when BLOCKSCOUT_API_KEY is set — the JSON-RPC path is different
+// from the REST one on the paid gateway too.
 const RPC_FALLBACK_URLS = {
-  robinhood: `${chainCfg('robinhood').blockscout}/api/eth-rpc`,
+  robinhood: BLOCKSCOUT_API_KEY
+    ? `https://api.blockscout.com/${chainCfg('robinhood').chainId}/json-rpc`
+    : 'https://robinhoodchain.blockscout.com/api/eth-rpc',
 };
 
 // Get best swap route
