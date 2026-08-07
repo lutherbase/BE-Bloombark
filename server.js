@@ -4918,6 +4918,184 @@ app.get('/api/trending-bloombark', async (req, res) => {
   }
 });
 
+/* ─── News: RSS aggregator + per-token coverage ───────────────────────────────
+   RSS-first by design so this works with zero API keys or signups. Each source
+   is fetched independently and a failing one is skipped rather than failing the
+   whole feed — these are third-party endpoints we don't control, so partial
+   results beat an error page.
+   CryptoPanic is layered on top ONLY when CRYPTOPANIC_TOKEN is set; it adds the
+   per-currency filtering and bull/bear vote signal that plain RSS lacks. */
+const NEWS_SOURCES = [
+  { name: 'CoinDesk',      url: 'https://www.coindesk.com/arc/outboundfeeds/rss/' },
+  { name: 'Cointelegraph', url: 'https://cointelegraph.com/rss' },
+  { name: 'Decrypt',       url: 'https://decrypt.co/feed' },
+  { name: 'The Block',     url: 'https://www.theblock.co/rss.xml' },
+];
+const CRYPTOPANIC_TOKEN = process.env.CRYPTOPANIC_TOKEN || '';
+const NEWS_TTL_MS = 10 * 60 * 1000;
+let _newsCache = { data: null, at: 0 };
+
+const _cdata = s => String(s || '').replace(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/, '$1');
+// &amp; must be decoded LAST, otherwise "&amp;lt;" would double-decode into "<".
+const _htmlEnt = s => String(s || '')
+  .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"')
+  .replace(/&#0?39;|&apos;|&#x27;/gi, "'").replace(/&nbsp;/gi, ' ')
+  .replace(/&#8217;|&rsquo;/gi, '’').replace(/&#8216;|&lsquo;/gi, '‘')
+  .replace(/&#8220;|&ldquo;/gi, '“').replace(/&#8221;|&rdquo;/gi, '”')
+  .replace(/&#8211;|&ndash;/gi, '–').replace(/&#8212;|&mdash;/gi, '—')
+  .replace(/&amp;/gi, '&');
+const _stripTags = s => String(s || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+const _escapeRe  = s => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function _parseRss(xml, sourceName) {
+  const out = [];
+  const blocks = String(xml).match(/<item[\s>][\s\S]*?<\/item>/gi) || [];
+  for (const b of blocks) {
+    // Namespaced tags (atom:link, dc:date) won't collide here — the ':' isn't
+    // matched by the name pattern, so <link> never picks up <atom:link>.
+    const tag = name => {
+      const m = b.match(new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)</${name}>`, 'i'));
+      return m ? _htmlEnt(_cdata(m[1])).trim() : '';
+    };
+    const title = _stripTags(tag('title'));
+    const link  = tag('link') || _htmlEnt(_cdata(b.match(/<guid(?:\s[^>]*)?>([\s\S]*?)<\/guid>/i)?.[1] || '')).trim();
+    if (!title || !link) continue;
+    const pub = tag('pubDate') || tag('dc:date');
+    const ts  = pub ? new Date(pub).getTime() : NaN;
+    // Self-closing media tags can't be read by tag(), so grab their url attr.
+    const thumb =
+      b.match(/<media:content[^>]+url=["']([^"']+)["']/i)?.[1] ||
+      b.match(/<media:thumbnail[^>]+url=["']([^"']+)["']/i)?.[1] ||
+      b.match(/<enclosure[^>]+url=["']([^"']+)["']/i)?.[1] ||
+      b.match(/<img[^>]+src=["']([^"']+)["']/i)?.[1] || null;
+    out.push({
+      title,
+      url: link,
+      source: sourceName,
+      publishedAt: Number.isFinite(ts) ? ts : null,
+      summary: _stripTags(tag('description')).slice(0, 220),
+      thumbnail: thumb,
+      votes: null,
+    });
+  }
+  return out;
+}
+
+// Same story republished by several outlets is one story to a reader — key on
+// a normalized title so the feed doesn't show the same headline four times.
+function _dedupeNews(items) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const key = String(it.title || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 80);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+
+async function _fetchRssNews() {
+  const settled = await Promise.allSettled(NEWS_SOURCES.map(s =>
+    axios.get(s.url, { timeout: 9000, headers: { 'User-Agent': 'BloombarkTerminal/1.0 (+https://bloombark.app)' } })
+      .then(r => _parseRss(r.data, s.name))
+  ));
+  const items = [];
+  settled.forEach((r, i) => {
+    if (r.status === 'fulfilled') items.push(...r.value);
+    else console.error(`[news] source failed (${NEWS_SOURCES[i].name}):`, r.reason?.message);
+  });
+  return _dedupeNews(items).sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
+}
+
+async function _fetchCryptoPanic(currencies) {
+  if (!CRYPTOPANIC_TOKEN) return [];
+  try {
+    const params = { auth_token: CRYPTOPANIC_TOKEN, public: 'true' };
+    if (currencies) params.currencies = currencies;
+    const { data } = await axios.get('https://cryptopanic.com/api/v1/posts/', { params, timeout: 9000 });
+    return (data?.results || []).map(p => ({
+      title: p.title || '',
+      url: p.url || '',
+      source: p.source?.title || 'CryptoPanic',
+      publishedAt: p.published_at ? new Date(p.published_at).getTime() : null,
+      summary: '',
+      thumbnail: null,
+      votes: p.votes ? { positive: p.votes.positive || 0, negative: p.votes.negative || 0 } : null,
+    })).filter(x => x.title && x.url);
+  } catch (e) {
+    console.error('[news] cryptopanic failed:', e.message);
+    return [];
+  }
+}
+
+app.get('/api/news', async (req, res) => {
+  const bypass = req.query.refresh === '1';
+  if (!bypass && _newsCache.data && Date.now() - _newsCache.at < NEWS_TTL_MS) {
+    return res.json({ success: true, items: _newsCache.data, cached: true });
+  }
+  try {
+    const [rss, panic] = await Promise.all([_fetchRssNews(), _fetchCryptoPanic(null)]);
+    const items = _dedupeNews([...panic, ...rss])
+      .sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0))
+      .slice(0, 60);
+    // Never cache an empty result — every source erroring at once would
+    // otherwise pin an empty feed in place for the full TTL.
+    if (items.length) _newsCache = { data: items, at: Date.now() };
+    res.json({ success: true, items });
+  } catch (e) {
+    console.error('[news] failed:', e.message);
+    res.status(500).json({ success: false, error: e.message, items: [] });
+  }
+});
+
+/* Per-token coverage. Most Robinhood-chain tokens are far too small to ever
+   appear in mainstream crypto media, so the Community mentions (an exact
+   contract-address match against our own chat) are the primary signal here and
+   the headline match is the bonus — not the other way round. */
+app.get('/api/news/token', async (req, res) => {
+  const symbol  = String(req.query.symbol || '').trim();
+  const address = String(req.query.address || '').trim().toLowerCase();
+  try {
+    let mentions = [];
+    if (/^0x[a-f0-9]{40}$/.test(address)) {
+      const since = Date.now() - 30 * 24 * 60 * 60 * 1000;
+      const ph = TRENDING_ROOM_EXCLUDE.map(() => '?').join(',');
+      // MySQL's default collation is case-insensitive, so a lowercased LIKE
+      // still matches however the user happened to type/paste the address.
+      const rows = await dbAll(
+        `SELECT room, display_name, text, ts FROM chat_messages
+         WHERE ts > ? AND room NOT IN (${ph}) AND text LIKE ?
+         ORDER BY ts DESC LIMIT 20`,
+        [since, ...TRENDING_ROOM_EXCLUDE, `%${address}%`]
+      );
+      mentions = rows.map(r => ({
+        room: r.room,
+        author: r.display_name || 'Anon',
+        text: String(r.text || '').slice(0, 240),
+        ts: Number(r.ts),
+      }));
+    }
+
+    // Ticker match needs >=3 chars: 1–2 letter symbols match random words in
+    // English headlines and would fill this card with unrelated articles.
+    let articles = [];
+    if (symbol.length >= 3) {
+      const [rss, panic] = await Promise.all([
+        _fetchRssNews(),
+        _fetchCryptoPanic(symbol.toUpperCase()),
+      ]);
+      const re = new RegExp(`\\b\\$?${_escapeRe(symbol)}\\b`, 'i');
+      articles = _dedupeNews([...panic, ...rss.filter(it => re.test(it.title))]).slice(0, 6);
+    }
+
+    res.json({ success: true, articles, mentions, mentionCount: mentions.length });
+  } catch (e) {
+    console.error('[news/token] failed:', e.message);
+    res.status(500).json({ success: false, error: e.message, articles: [], mentions: [] });
+  }
+});
+
 // ─── Sniper Assistance: on-chain new-pool detector ──────────────────────────
 // Scans for the *universal* PairCreated (Uniswap V2 and every V2 fork —
 // confirmed this covers Robinhood chain's official Uniswap V2 deployment AND
