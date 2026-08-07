@@ -4427,9 +4427,53 @@ async function requireAuth(req, res, next) {
 
 // ─── POST /api/auth/login ───────────────────────────────────────────────────────
 // Called after frontend verifies SIWE with Privy — saves wallet + issues JWT
+/* ─── Wallet ownership proof (SIWE-style challenge/response) ──────────────────
+   A wallet address is public information, so accepting one on its own proves
+   nothing — the caller must sign a server-issued nonce to show they hold the
+   private key. Nonces are single-use and short-lived so a captured signature
+   can't be replayed.
+   Kept in memory rather than a table: the window between issuing a nonce and
+   verifying it is seconds, and losing them on restart just means the user
+   signs again. */
+const AUTH_NONCE_TTL_MS = 5 * 60 * 1000;
+const _authNonces = new Map(); // nonce -> { wallet, message, at }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [nonce, entry] of _authNonces) {
+    if (now - entry.at > AUTH_NONCE_TTL_MS) _authNonces.delete(nonce);
+  }
+}, 60 * 1000).unref?.();
+
+function _siweMessage(wallet, nonce, issuedAt) {
+  return [
+    'Bloombark Terminal wants you to sign in with your wallet:',
+    wallet,
+    '',
+    'Signing is free and will not trigger a blockchain transaction.',
+    '',
+    `Nonce: ${nonce}`,
+    `Issued At: ${issuedAt}`,
+  ].join('\n');
+}
+
+app.post('/api/auth/nonce', (req, res) => {
+  const wallet = String(req.body?.wallet || '');
+  if (!/^0x[0-9a-fA-F]{40}$/.test(wallet)) {
+    return res.status(400).json({ error: 'valid EVM wallet address required' });
+  }
+  const nonce    = crypto.randomBytes(16).toString('hex');
+  const issuedAt = new Date().toISOString();
+  // Store the exact string that gets signed, so verification can't drift from
+  // what the wallet actually saw.
+  const message  = _siweMessage(wallet, nonce, issuedAt);
+  _authNonces.set(nonce, { wallet: wallet.toLowerCase(), message, at: Date.now() });
+  res.json({ success: true, nonce, message });
+});
+
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { wallet, privyUserId, meta } = req.body;
+    const { wallet, privyUserId, meta, signature, nonce } = req.body;
     if (!wallet) return res.status(400).json({ error: 'wallet required' });
     const isEvm   = /^0x[0-9a-fA-F]{40}$/.test(wallet);
     const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(wallet);
@@ -4438,6 +4482,29 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const walletLower = wallet.toLowerCase();
+
+    // EVM logins must prove ownership. Without this any caller could mint a
+    // session for any address — including an admin wallet.
+    if (isEvm) {
+      const entry = nonce ? _authNonces.get(nonce) : null;
+      // Burn the nonce on any attempt so a guessed/leaked one can't be retried.
+      if (nonce) _authNonces.delete(nonce);
+      if (!entry || Date.now() - entry.at > AUTH_NONCE_TTL_MS) {
+        return res.status(401).json({ error: 'Sign-in challenge expired — please try connecting again' });
+      }
+      if (entry.wallet !== walletLower) {
+        return res.status(401).json({ error: 'Challenge was issued for a different wallet' });
+      }
+      let recovered;
+      try {
+        recovered = ethers.verifyMessage(entry.message, String(signature || ''));
+      } catch (_) {
+        return res.status(401).json({ error: 'Malformed signature' });
+      }
+      if (recovered.toLowerCase() !== walletLower) {
+        return res.status(401).json({ error: 'Signature does not match wallet' });
+      }
+    }
     const walletEnc   = encrypt(walletLower);
     const metaStr     = meta ? JSON.stringify(meta) : null;
     const now         = Math.floor(Date.now() / 1000);
