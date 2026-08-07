@@ -393,24 +393,28 @@ const CHAIN_NETWORKS = {
     testnet: { chainId: 11155420, hex: '0xaa37dc',  rpc: 'https://optimism-sepolia-rpc.publicnode.com', explorer: 'https://sepolia-optimism.etherscan.io',  blockscout: 'https://explorer.optimism.io', name: 'OP Sepolia' },
   },
   robinhood: {
-    mainnet: { chainId: 4663,  hex: '0x1237', rpc: 'https://robinhoodchain.blockscout.com/api/eth-rpc',      explorer: 'https://robinhoodchain.blockscout.com',      blockscout: 'https://robinhoodchain.blockscout.com' },
+    // RPC points at Robinhood's own node, not Blockscout's eth-rpc proxy: the
+    // proxy is rate limited to ~3 req/min without a paid key (a single
+    // pending-tx confirmation poll exceeds that), while the official endpoint
+    // has no such limit. ROBINHOOD_RPC_URL overrides it — useful on networks
+    // where robinhood.com is DNS-blocked, which some ISPs do.
+    mainnet: { chainId: 4663,  hex: '0x1237', rpc: process.env.ROBINHOOD_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com/rpc', explorer: 'https://robinhoodchain.blockscout.com',      blockscout: 'https://robinhoodchain.blockscout.com' },
     testnet: { chainId: 46630, hex: '0xb626', rpc: 'https://rpc.testnet.chain.robinhood.com/rpc',            explorer: 'https://explorer.testnet.chain.robinhood.com', blockscout: 'https://explorer.testnet.chain.robinhood.com', name: 'Robinhood Testnet' },
   },
 };
 
-// Blockscout Pro API key (optional) — Robinhood chain's default RPC/REST is
-// proxied through Blockscout's own free instance, which enforces a very
-// tight 3 req/min rate limit without a key (confirmed hitting this in
-// practice — even a single pending-tx confirmation poll blows past it). When
-// BLOCKSCOUT_API_KEY is set, route Robinhood-chain RPC + REST calls through
-// Blockscout's Pro API gateway instead (same data/shape, ~600 req/min).
+// Blockscout Pro API key (optional) — applies to the REST API only. That data
+// (token balances, address tx history, chain stats) is Blockscout-specific and
+// has no equivalent on a plain JSON-RPC node, so those calls still go through
+// Blockscout; its free instance allows only ~3 req/min, the Pro gateway ~600.
+// Plain RPC no longer depends on this key at all — it goes direct to
+// Robinhood's node (see CHAIN_NETWORKS above).
 // Explorer links shown to users are untouched — only the API-consuming host
 // changes. Testnet is left alone; it isn't Blockscout-proxied.
 const BLOCKSCOUT_API_KEY = process.env.BLOCKSCOUT_API_KEY || '';
 const BLOCKSCOUT_AUTH_HEADERS = BLOCKSCOUT_API_KEY ? { Authorization: `Bearer ${BLOCKSCOUT_API_KEY}` } : {};
 if (BLOCKSCOUT_API_KEY) {
   const rh = CHAIN_NETWORKS.robinhood.mainnet;
-  rh.rpc = `https://api.blockscout.com/${rh.chainId}/json-rpc`;
   // Every consumer of .blockscout appends its own `/api/v2/...` path (see
   // getEvmData, _fetchOnchainSwaps, _fetchChainTransactions) — this must be
   // the bare host, not pre-suffixed with /api/v2, or every REST call doubles
