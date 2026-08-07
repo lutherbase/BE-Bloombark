@@ -5937,6 +5937,15 @@ const KYBER_CHAINS = { ethereum:'ethereum', base:'base', arbitrum:'arbitrum', po
 const TRADE_FEE_BPS      = 5;
 const TRADE_FEE_TREASURY = process.env.PRIVATE_GATE_TREASURY || '0xf6a2b3016c7ac86724fa71cd4b3946facb319caa';
 const RPC_URLS = Object.fromEntries(Object.keys(CHAIN_NETWORKS).map(k => [k, chainCfg(k).rpc]));
+// Robinhood's own RPC has no rate limit when tested from a residential/office
+// IP, but Cloudflare (which fronts it) throttles/blocks a chunk of requests
+// coming from Render's datacenter IPs — a class of traffic Cloudflare's bot
+// heuristics commonly flag regardless of request volume. Blockscout's eth-rpc
+// proxy is the fallback of last resort for THIS server-to-server path only
+// (still capped, but better than a hard failure).
+const RPC_FALLBACK_URLS = {
+  robinhood: `${chainCfg('robinhood').blockscout}/api/eth-rpc`,
+};
 
 // Get best swap route
 app.get('/api/trade/kyber/route', async (req, res) => {
@@ -6075,25 +6084,28 @@ app.post('/api/trade/limit-order/cancel', express.json({ limit: '10kb' }), async
 // JSON-RPC proxy to public nodes (decimals, balance, allowance reads)
 app.post('/api/trade/rpc/:chain', express.json({ limit: '100kb' }), async (req, res) => {
   try {
-    const url = RPC_URLS[req.params.chain];
+    const chain = req.params.chain;
+    const url = RPC_URLS[chain];
     if (!url) return res.status(400).json({ error: 'unsupported chain' });
-    // Same 429 as _ethCallWithRetry deals with elsewhere — chains whose "RPC"
-    // is really their block explorer proxy (Robinhood chain) rate-limit
-    // readily, and this generic proxy (decimals/balance/allowance reads
-    // across Trade, Limit Order, Holdings) previously had zero resilience to
-    // that, unlike the on-chain-swaps fallback path.
+    // Try the chain's own RPC first (retrying once on 429), then fall back
+    // to Blockscout's eth-rpc proxy if that chain has one configured — see
+    // RPC_FALLBACK_URLS for why the primary can still fail from this server.
+    const candidates = [url, RPC_FALLBACK_URLS[chain]].filter(Boolean);
     let lastErr;
-    for (let attempt = 0; attempt <= 1; attempt++) {
-      try {
-        const r = await axios.post(url, req.body, { timeout: 10000, headers: BLOCKSCOUT_AUTH_HEADERS });
-        return res.json(r.data);
-      } catch (e) {
-        lastErr = e;
-        if (e.response?.status === 429 && attempt < 1) {
-          await new Promise(r => setTimeout(r, 800));
-          continue;
+    for (const candidateUrl of candidates) {
+      for (let attempt = 0; attempt <= 1; attempt++) {
+        try {
+          const r = await axios.post(candidateUrl, req.body, { timeout: 10000, headers: BLOCKSCOUT_AUTH_HEADERS });
+          if (r.data?.error) { lastErr = new Error(r.data.error.message || 'RPC error'); break; }
+          return res.json(r.data);
+        } catch (e) {
+          lastErr = e;
+          if (e.response?.status === 429 && attempt < 1) {
+            await new Promise(r => setTimeout(r, 800));
+            continue;
+          }
+          break;
         }
-        break;
       }
     }
     res.status(502).json({ error: lastErr.message });
