@@ -2817,12 +2817,22 @@ const _dsGet = url => axios.get(url, { timeout: 8000 }).catch(() => null);
 // endpoints (pools / trending_pools / new_pools) — one call per chain per
 // endpoint kind. Failures (incl. 429) are swallowed so a Gecko hiccup never
 // breaks the dashboard; it only means fewer fresh entries that refresh cycle.
+// "uniswap-v3-robinhood" -> "Uniswap v3". The chain suffix is dropped because
+// every row already carries a chain badge, and version stays lowercase since
+// that's how these protocols brand themselves.
+function _dexLabel(id) {
+  if (!id) return '';
+  return String(id).replace(/-[a-z0-9]+$/i, '').split('-')
+    .map(p => /^v\d+$/i.test(p) ? p.toLowerCase() : p.charAt(0).toUpperCase() + p.slice(1))
+    .join(' ');
+}
+
 async function _geckoPoolsList(chainId, kind = 'trending_pools') {
   const network = GECKO_NETWORK[chainId];
   if (!network) return [];
   try {
     const { data } = await axios.get(
-      `https://api.geckoterminal.com/api/v2/networks/${network}/${kind}?limit=20&include=base_token,quote_token`,
+      `https://api.geckoterminal.com/api/v2/networks/${network}/${kind}?limit=20&include=base_token,quote_token,dex`,
       { timeout: 8000, headers: GECKO_HEADS }
     );
     const included = {};
@@ -2834,10 +2844,19 @@ async function _geckoPoolsList(chainId, kind = 'trending_pools') {
       const baseToken  = included[baseTokenId];
       const quoteToken = included[quoteTokenId];
       if (!a.address) return null;
+      // One token routinely has several pools (different fee tiers, different
+      // Uniswap versions, different quote token). Gecko encodes the fee tier as
+      // a trailing suffix on a.name ("CASHCAT / WETH 1%"), and the DEX version
+      // lives in the dex relationship — together they're the ONLY things that
+      // tell those otherwise-identical-looking rows apart, so surface both
+      // instead of dropping them.
+      const feeTier = (String(a.name || '').match(/\s([\d.]+\s*%)\s*$/) || [])[1] || null;
       return {
-        // Build from token symbols rather than a.name (e.g. "WETH / USDC 0.05%")
-        // so the fee-tier suffix doesn't leak into the displayed pair name.
+        // Built from token symbols rather than a.name so the fee tier renders
+        // as its own badge (see feeTier below) instead of running into the pair.
         name:           `${baseToken?.symbol || '?'} / ${quoteToken?.symbol || '?'}`,
+        feeTier:        feeTier ? feeTier.replace(/\s+/g, '') : null,
+        dex:            _dexLabel(p.relationships?.dex?.data?.id),
         address:        baseToken?.address || '',
         pairAddress:    a.address,
         network:        _dashChainLabel(chainId),
